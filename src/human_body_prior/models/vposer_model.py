@@ -51,10 +51,22 @@ class NormalDistDecoder(nn.Module):
 
         self.mu = nn.Linear(num_feat_in, latentD)
         self.logvar = nn.Linear(num_feat_in, latentD)
+        self.mu_printer = PrintStats(msg="Z dist - mu")
+        self.logvar_printer = PrintStats(msg="Z dist - logvar")
 
     def forward(self, Xout):
+        # self.mu_printer(self.mu(Xout))
+        # self.logvar_printer(self.logvar(Xout))
         return torch.distributions.normal.Normal(self.mu(Xout), F.softplus(self.logvar(Xout)))
 
+class PrintStats(nn.Module):
+    def __init__(self, msg=""):
+        super(PrintStats, self).__init__()
+        self.msg = msg
+
+    def forward(self, x):
+        print(f"{self.msg} mean={x.mean().item():.4f} std={x.std().item():.4f} min={x.min().item():.4f} max={x.max().item():.4f} minabs={x.abs().min().item():.4f} maxabs={x.abs().max().item():.4f}")
+        return x
 
 class VPoser(nn.Module):
     def __init__(self, model_ps):

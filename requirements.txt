@@ -1,11 +1,12 @@
-#git+https://github.com/nghorbani/body_visualizer
+git+https://github.com/nghorbani/body_visualizer
 git+https://github.com/MPI-IS/configer.git
 git+https://github.com/MPI-IS/mesh.git
 
 tqdm
 numpy
 dotmap
-pytorch-lightning
+# pytorch-lightning
+pytorch_lightning==1.8.5
 PyYAML
 torch
 transforms3d==0.3.1
@@ -13,3 +14,8 @@ pytorch3d
 omegaconf
 loguru
 
+pip
+ipykernel
+matplotlib
+trimesh
+pyrender

@@ -31,7 +31,7 @@ from human_body_prior.data.dataloader import VPoserDS
 from human_body_prior.tools.model_loader import load_vposer
 from human_body_prior.tools.omni_tools import copy2cpu as c2c
 from human_body_prior.tools.omni_tools import makepath
-from human_body_prior.train.vposer_smpl import VPoserTrainer
+from human_body_prior.train.vposer_trainer import VPoserTrainer
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 

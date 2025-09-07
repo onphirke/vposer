@@ -1,0 +1,86 @@
+---
+body_model:
+  gender: neutral
+  bm_fname: _data/models/models_lockedhead/smplx/SMPLX_NEUTRAL.npz
+
+general:
+  verbosity: 0
+  expr_id: V_me_all
+  dataset_id: first-run
+  rnd_seed: 100
+  work_basedir: _data/_runs/
+  dataset_basedir: _data/datasets/
+
+logging:
+  expr_msg:
+  num_bodies_to_display: 25
+  work_dir:
+  dataset_dir:
+  render_during_training: False
+  best_model_fname:
+
+train_parms:
+  batch_size: 128
+  num_epochs: 100
+  restore_optimizer: False
+  gen_optimizer:
+    type: Adam
+    args:
+      lr: 0.001
+      weight_decay: 0.00001
+  lr_scheduler:
+    type: ReduceLROnPlateau
+    args:
+      #      metrics: val_loss
+      verbose: true
+      patience: 5
+  early_stopping:
+    monitor: val_loss
+    min_delta: 0.0
+    patience: 10
+    verbose: True
+    mode: min
+  keep_extra_loss_terms_until_epoch: 15
+  loss_weights:
+    loss_kl_wt: 0.005
+    loss_rec_wt: 4
+    loss_matrot_wt: 2
+    loss_jtr_wt: 2
+
+
+data_parms:
+  num_workers: 8 # Used for dataloaders
+  amass_dir: _data/amass/
+  num_timeseq_frames: 1
+  amass_splits:
+    vald:
+      - CNRS
+      # - HumanEva
+      # - MPI_HDM05
+      # - SFU
+      # - MPI_mosh
+      # - BMLrub_vald
+    train:
+      # - CMU
+      # - BMLrub_train
+      # - MPI_Limits
+      # - TotalCapture
+      # - Eyes_Japan_Dataset
+      # - KIT
+      # - BMLrub
+      - EKUT
+      # - TCD_handMocap
+      - ACCAD
+      # - BMLmovi
+    test:
+      - DFaust
+      # - BMLrub_test
+      # - Transitions_mocap
+      # - SSM_synced
+      # - DFaust_67
+
+
+model_params:
+  num_neurons : 512
+  latentD : 32
+

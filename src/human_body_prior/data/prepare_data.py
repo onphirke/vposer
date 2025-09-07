@@ -28,12 +28,12 @@ import shutil
 import numpy as np
 import torch
 from configer import Configer
-from human_body_prior.tools.omni_tools import logger_sequencer
-from human_body_prior.tools.omni_tools import makepath, log2file
+
+from human_body_prior.tools.omni_tools import log2file, logger_sequencer, makepath
 
 
 def dataset_exists(dataset_dir, split_names=None):
-    '''
+    """
     This function checks whether a valid SuperCap dataset directory exists at a location
     Parameters
     ----------
@@ -42,32 +42,36 @@ def dataset_exists(dataset_dir, split_names=None):
     Returns
     -------
 
-    '''
-    if dataset_dir is None: return False
+    """
+    if dataset_dir is None:
+        return False
     if split_names is None:
-        split_names = ['train', 'vald', 'test']
+        split_names = ["train", "vald", "test"]
     import os
 
     import numpy as np
 
     done = []
     for split_name in split_names:
-        for k in ['root_orient', 'pose_body']:  # , 'betas', 'trans', 'joints']:
-            outfname = os.path.join(dataset_dir, split_name, f'{k}.pt')
+        for k in ["root_orient", "pose_body"]:  # , 'betas', 'trans', 'joints']:
+            outfname = os.path.join(dataset_dir, split_name, f"{k}.pt")
             done.append(os.path.exists(outfname))
     return np.all(done)
 
 
 def prepare_vposer_datasets(vposer_dataset_dir, amass_splits, amass_dir, logger=None):
     if dataset_exists(vposer_dataset_dir):
-        if logger is not None: logger(f'VPoser dataset already exists at {vposer_dataset_dir}')
+        if logger is not None:
+            logger(f"VPoser dataset already exists at {vposer_dataset_dir}")
         return
 
-    ds_logger = log2file(makepath(vposer_dataset_dir, 'dataset.log', isfile=True), write2file_only=True)
+    ds_logger = log2file(
+        makepath(vposer_dataset_dir, "dataset.log", isfile=True), write2file_only=True
+    )
     logger = ds_logger if logger is None else logger_sequencer([ds_logger, logger])
 
-    logger(f'Creating pytorch dataset at {vposer_dataset_dir}')
-    logger(f'Using AMASS body parameters from {amass_dir}')
+    logger(f"Creating pytorch dataset at {vposer_dataset_dir}")
+    logger(f"Using AMASS body parameters from {amass_dir}")
 
     shutil.copy2(__file__, vposer_dataset_dir)
 
@@ -86,42 +90,61 @@ def prepare_vposer_datasets(vposer_dataset_dir, amass_splits, amass_dir, logger=
 
         npz_fnames = []
         for ds_name in ds_names:
-            mosh_stageII_fnames = glob.glob(osp.join(amass_dir, ds_name, '*/*_poses.npz'))
+            mosh_stageII_fnames = glob.glob(
+                osp.join(amass_dir, ds_name, "*/*_stageii.npz")
+                # osp.join(amass_dir, ds_name, "*/*_poses.npz")
+            )
             npz_fnames.extend(mosh_stageII_fnames)
-            logger('Found {} sequences from {}.'.format(len(mosh_stageII_fnames), ds_name))
+            logger(
+                "Found {} sequences from {}.".format(len(mosh_stageII_fnames), ds_name)
+            )
 
-            for npz_fname in npz_fnames:
-                cdata = np.load(npz_fname)
-                N = len(cdata['poses'])
+        for npz_fname in npz_fnames:
+            cdata = np.load(npz_fname)
+            N = len(cdata["poses"])
 
-                # skip first and last frames to avoid initial standard poses, e.g. T pose
-                cdata_ids = np.random.choice(list(range(int(0.1 * N), int(0.9 * N), 1)), int(keep_rate * 0.8 * N),
-                                             replace=False)
-                if len(cdata_ids) < 1: continue
-                fullpose = cdata['poses'][cdata_ids].astype(np.float32)
-                yield {'pose_body': fullpose[:, 3:66], 'root_orient': fullpose[:, :3]}
+            # skip first and last frames to avoid initial standard poses, e.g. T pose
+            cdata_ids = np.random.choice(
+                list(range(int(0.1 * N), int(0.9 * N), 1)),
+                int(keep_rate * 0.8 * N),
+                replace=False,
+            )
+            if len(cdata_ids) < 1:
+                continue
+            fullpose = cdata["poses"][cdata_ids].astype(np.float32)
+            yield {"pose_body": fullpose[:, 3:66], "root_orient": fullpose[:, :3]}
 
     for split_name, ds_names in amass_splits.items():
-        if dataset_exists(vposer_dataset_dir, split_names=[split_name]): continue
-        logger(f'Preparing VPoser data for split {split_name}')
+        if dataset_exists(vposer_dataset_dir, split_names=[split_name]):
+            continue
+        logger(f"Preparing VPoser data for split {split_name}")
 
         data_fields = {}
         for data in fetch_from_amass(ds_names):
             for k in data.keys():
-                if k not in data_fields: data_fields[k] = []
+                if k not in data_fields:
+                    data_fields[k] = []
                 data_fields[k].append(data[k])
 
+        total_v_len = 0
+
         for k, v in data_fields.items():
-            outpath = makepath(vposer_dataset_dir, split_name, '{}.pt'.format(k), isfile=True)
+            outpath = makepath(
+                vposer_dataset_dir, split_name, "{}.pt".format(k), isfile=True
+            )
             v = np.concatenate(v)
+            total_v_len += len(v)
             torch.save(torch.tensor(v), outpath)
 
         logger(
-            f'{len(v)} datapoints dumped for split {split_name}. ds_meta_pklpath: {osp.join(vposer_dataset_dir, split_name)}')
+            f"{total_v_len} datapoints dumped for split {split_name}. ds_meta_pklpath: {osp.join(vposer_dataset_dir, split_name)}"
+        )
 
-    Configer(**{
-        'amass_splits': amass_splits.toDict(),
-        'amass_dir': amass_dir,
-    }).dump_settings(makepath(vposer_dataset_dir, 'settings.ini', isfile=True))
+    Configer(
+        **{
+            "amass_splits": dict(amass_splits),
+            "amass_dir": amass_dir,
+        }
+    ).dump_settings(makepath(vposer_dataset_dir, "settings.ini", isfile=True))
 
-    logger(f'Dumped final pytorch dataset at {vposer_dataset_dir}')
+    logger(f"Dumped final pytorch dataset at {vposer_dataset_dir}")
