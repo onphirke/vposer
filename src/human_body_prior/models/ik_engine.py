@@ -46,7 +46,6 @@ from human_body_prior.tools.model_loader import load_model
 from human_body_prior.tools.omni_tools import copy2cpu as c2c
 from human_body_prior.tools.omni_tools import flatten_list, log2file
 
-
 def visualize(points, bm_f, mvs, kpts_colors, verbosity=2, logger=None):
     from human_body_prior.tools.omni_tools import log2file
 
@@ -143,13 +142,15 @@ def ik_fit(
     extra_params={},
     on_step=None,
     gstep=0,
-):
+):    
     data_loss = extra_params.get("data_loss", torch.nn.SmoothL1Loss(reduction="mean"))
 
     # data_loss =
     # data_loss = torch.nn.L1Loss(reduction='mean')#change with SmoothL1
 
     def fit(weights, free_vars):
+        # input(f"{fit.gstep} | press any key to continue...")
+        
         fit.gstep += 1
         optimizer.zero_grad()
 
@@ -243,7 +244,7 @@ class IK_Engine(nn.Module):
         if verbosity > 1 and can_display:
             mvs = MeshViewers(display_rc, keepalive=True)
             self.mvs = flatten_list(mvs)
-            self.mvs[0].set_background_color(colors["white"])
+            self.mvs[0].set_background_color(colors["white"], blocking=False)
         else:
             self.mvs = None
 
