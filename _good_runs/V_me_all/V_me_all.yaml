@@ -1,0 +1,58 @@
+body_model:
+  bm_fname: _data/models/models_lockedhead/smplx/SMPLX_NEUTRAL.npz
+  gender: neutral
+data_parms:
+  amass_dir: _data/amass/
+  amass_splits:
+    test:
+    - DFaust
+    train:
+    - EKUT
+    - ACCAD
+    vald:
+    - CNRS
+  num_timeseq_frames: 1
+  num_workers: 8
+general:
+  dataset_basedir: _data/datasets/
+  dataset_id: first-run
+  expr_id: V_me_all
+  rnd_seed: 100
+  verbosity: 0
+  work_basedir: _data/_runs/
+logging:
+  best_model_fname: null
+  dataset_dir: _data/datasets/first-run
+  expr_msg: '[V_me_all] batch_size = 128.'
+  num_bodies_to_display: 25
+  render_during_training: false
+  work_dir: _data/_runs/V_me_all
+model_params:
+  latentD: 32
+  num_neurons: 512
+train_parms:
+  batch_size: 128
+  early_stopping:
+    min_delta: 0.0
+    mode: min
+    monitor: val_loss
+    patience: 10
+    verbose: true
+  gen_optimizer:
+    args:
+      lr: 0.001
+      weight_decay: 1.0e-05
+    type: Adam
+  keep_extra_loss_terms_until_epoch: 15
+  loss_weights:
+    loss_jtr_wt: 2
+    loss_kl_wt: 0.005
+    loss_matrot_wt: 2
+    loss_rec_wt: 4
+  lr_scheduler:
+    args:
+      patience: 5
+      verbose: true
+    type: ReduceLROnPlateau
+  num_epochs: 100
+  restore_optimizer: false

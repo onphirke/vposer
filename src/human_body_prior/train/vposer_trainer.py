@@ -216,36 +216,55 @@ class VPoserTrainer(LightningModule):
         q_z = drec["q_z"]
         # dorig['fullpose'] = torch.cat([dorig['root_orient'], dorig['pose_body']], dim=-1)
 
+        # ======================================================
         # Reconstruction loss - L1 on the output mesh
+        #   note: paper suggests using L2 loss, but it appears they implement with L1 instead
+        #         for training. they output L2 reconstruction loss in the validation metrics though
+        # ======================================================
         with torch.no_grad():
             bm_orig = self.bm_train(pose_body=dorig["pose_body"])
-
         bm_rec = self.bm_train(pose_body=drec["pose_body"].contiguous().view(bs, -1))
-
         v2v = l1_loss(bm_rec.v, bm_orig.v)
 
-        # KL loss
+        # ======================================================
+        # KL Divergence loss - kl divergence with N(0,1)
+        # ======================================================
         p_z = torch.distributions.normal.Normal(
             loc=torch.zeros((bs, latentD), device=device, requires_grad=False),
             scale=torch.ones((bs, latentD), device=device, requires_grad=False),
         )
+        kl_loss = torch.mean(
+            torch.sum(torch.distributions.kl.kl_divergence(q_z, p_z), dim=[1])
+        )
+
+        # ======================================================
+        # the weighted loss dict, they use for training
+        # ======================================================
+
         weighted_loss_dict = {
-            "loss_kl": loss_kl_wt
-            * torch.mean(
-                torch.sum(torch.distributions.kl.kl_divergence(q_z, p_z), dim=[1])
-            ),
+            "loss_kl": loss_kl_wt * kl_loss,
             "loss_mesh_rec": loss_rec_wt * v2v,
         }
 
+        # ======================================================
+        # they only add these matrix checks up to some epochs, likely for stability
+        # ======================================================
         if (
             self.current_epoch
             < self.vp_ps.train_parms.keep_extra_loss_terms_until_epoch
         ):
-            # breakpoint()
+            # ======================================================
+            # Rotation matrix loss - Geodesic loss between the rotations.
+            #   note: paper suggests using L2 loss, but it appears they implement with geodesic loss instead
+            # ======================================================
             weighted_loss_dict["matrot"] = loss_matrot_wt * geodesic_loss(
                 drec["pose_body_matrot"].view(-1, 3, 3),
                 aa2matrot(dorig["pose_body"].view(-1, 3)),
             )
+
+            # ======================================================
+            # Loss on the joint positions - L1 reconstruction loss on the joints
+            # ======================================================
             weighted_loss_dict["jtr"] = loss_jtr_wt * l1_loss(bm_rec.Jtr, bm_orig.Jtr)
             pass
 
@@ -275,56 +294,56 @@ class VPoserTrainer(LightningModule):
             "unweighted_loss": unweighted_loss_dict,
         }
 
-    @torch.no_grad()
-    def _check_nans(self, batch):
-        if torch.isnan(batch["pose_body"]).any():
-            raise ValueError("NaN detected in input batch['pose_body']")
-        if torch.isinf(batch["pose_body"]).any():
-            raise ValueError("Inf detected in input batch['pose_body']")
-        for name, param in self.vp_model.named_parameters():
-            if torch.isnan(param).any():
-                raise ValueError(f"NaN detected in model parameter {name}")
-            if torch.isinf(param).any():
-                raise ValueError(f"Inf detected in model parameter {name}")
-            if param.grad is not None:
-                if torch.isnan(param.grad).any():
-                    raise ValueError(
-                        f"NaN detected in gradient of model parameter {name}"
-                    )
-                if torch.isinf(param.grad).any():
-                    raise ValueError(
-                        f"Inf detected in gradient of model parameter {name}"
-                    )
+    # @torch.no_grad()
+    # def _check_nans(self, batch):
+    #     if torch.isnan(batch["pose_body"]).any():
+    #         raise ValueError("NaN detected in input batch['pose_body']")
+    #     if torch.isinf(batch["pose_body"]).any():
+    #         raise ValueError("Inf detected in input batch['pose_body']")
+    #     for name, param in self.vp_model.named_parameters():
+    #         if torch.isnan(param).any():
+    #             raise ValueError(f"NaN detected in model parameter {name}")
+    #         if torch.isinf(param).any():
+    #             raise ValueError(f"Inf detected in model parameter {name}")
+    #         if param.grad is not None:
+    #             if torch.isnan(param.grad).any():
+    #                 raise ValueError(
+    #                     f"NaN detected in gradient of model parameter {name}"
+    #                 )
+    #             if torch.isinf(param.grad).any():
+    #                 raise ValueError(
+    #                     f"Inf detected in gradient of model parameter {name}"
+    #                 )
 
-    @torch.no_grad()
-    def _find_max_abs_grad(self):
-        max_abs_grad = 0.0
-        max_param_name = ""
-        for name, param in self.vp_model.named_parameters():
-            if param.grad is not None:
-                param_max = param.grad.abs().max().item()
-                print(
-                    f"Param: {name:<30} Max abs grad: {param_max:<15.6f} Max abs value: {param.data.abs().max().item():<15.6f}"
-                )
-                if param_max > max_abs_grad:
-                    max_abs_grad = param_max
-                    max_param_name = name
-        return max_abs_grad, max_param_name
+    # @torch.no_grad()
+    # def _find_max_abs_grad(self):
+    #     max_abs_grad = 0.0
+    #     max_param_name = ""
+    #     for name, param in self.vp_model.named_parameters():
+    #         if param.grad is not None:
+    #             param_max = param.grad.abs().max().item()
+    #             print(
+    #                 f"Param: {name:<30} Max abs grad: {param_max:<15.6f} Max abs value: {param.data.abs().max().item():<15.6f}"
+    #             )
+    #             if param_max > max_abs_grad:
+    #                 max_abs_grad = param_max
+    #                 max_param_name = name
+    #     return max_abs_grad, max_param_name
 
-    @torch.no_grad()
-    def _zero_grad(self):
-        for param in self.vp_model.parameters():
-            if param.grad is not None:
-                param.grad.zero_()
+    # @torch.no_grad()
+    # def _zero_grad(self):
+    #     for param in self.vp_model.parameters():
+    #         if param.grad is not None:
+    #             param.grad.zero_()
 
-    @torch.no_grad()
-    def _prettyprint_loss(self, loss):
-        def _convert_subloss(subloss_dict):
-            return "  ".join([f"{k}={v.item():.4f}" for k, v in subloss_dict.items()])
+    # @torch.no_grad()
+    # def _prettyprint_loss(self, loss):
+    #     def _convert_subloss(subloss_dict):
+    #         return "  ".join([f"{k}={v.item():.4f}" for k, v in subloss_dict.items()])
 
-        weighted_str = _convert_subloss(loss["weighted_loss"])
-        unweighted_str = _convert_subloss(loss["unweighted_loss"])
-        return f"weighted: {{{weighted_str}}}, unweighted: {{{unweighted_str}}}"
+    #     weighted_str = _convert_subloss(loss["weighted_loss"])
+    #     unweighted_str = _convert_subloss(loss["unweighted_loss"])
+    #     return f"weighted: {{{weighted_str}}}, unweighted: {{{unweighted_str}}}"
 
     def training_step(self, batch, batch_idx, optimizer_idx=None):
         # for debugging
@@ -479,16 +498,16 @@ def train_vposer_once(_config):
             )
 
     trainer = pl.Trainer(
-        # Remove deprecated distributed_backend
-        # Remove deprecated weights_summary
+        # initial repo had deprecated arguments
+        # - deprecated distributed_backend
+        # - deprecated weights_summary
         strategy=DDPStrategy(find_unused_parameters=False),
         callbacks=[lr_monitor, early_stop_callback, checkpoint_callback],
         max_epochs=model.vp_ps.train_parms.num_epochs,
         logger=logger,
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
         # gradient_clip_val=1.0,
-        # Remove deprecated resume_from_checkpoint here
     )
 
-    # Pass ckpt_path to fit() instead
+    # we pass ckpt_path to fit() instead
     trainer.fit(model, ckpt_path=resume_from_checkpoint)
