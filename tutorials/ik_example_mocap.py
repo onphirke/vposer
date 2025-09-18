@@ -67,8 +67,9 @@ class SourceKeyPoints(nn.Module):
         new_body = self.bm(**body_parms)
 
         vn = compute_vertex_normal_batched(new_body.v, new_body.f)
+        
+        # looks like they are adding an offset of 0.0095 along the normal direction, perhaps to represent sensor thickness?
         virtual_markers = new_body.v[:, self.vids] + 0.0095 * vn[:, self.vids]
-
         return {"source_kpts": virtual_markers, "body": new_body}
 
 
