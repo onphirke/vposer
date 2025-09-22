@@ -17,7 +17,11 @@ trimesh
 pyrender
 colour
 
+pandas
+
 pyglet
+
+imageio[ffmpeg]
 
 git+https://github.com/nghorbani/body_visualizer
 git+https://github.com/MPI-IS/configer.git

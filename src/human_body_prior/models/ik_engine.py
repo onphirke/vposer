@@ -31,6 +31,7 @@ try:
     from body_visualizer.tools.mesh_tools import rotateXYZ
     from body_visualizer.tools.vis_tools import colors
     from psbody.mesh import Mesh, MeshViewers
+    from psbody.mesh.lines import Lines
 
 except Exception as e:
     print(e)
@@ -83,25 +84,34 @@ def visualize(points, bm_f, mvs, kpts_colors, verbosity=2, logger=None):
 
                 orig_mrk_mesh = points_to_spheres(
                     rotateXYZ(c2c(points[fId]), [-90, 0, 0]),
-                    radius=0.01,
+                    radius=0.03,
                     point_color=kpts_colors,
                 )
                 virtual_markers_mesh = points_to_cubes(
                     rotateXYZ(virtual_markers[fId], [-90, 0, 0]),
-                    radius=0.01,
+                    radius=0.03,
                     point_color=kpts_colors,
                 )
+
                 new_body_mesh = Mesh(new_body_v, bm_f, vc=colors["grey"])
 
+                linev = rotateXYZ(np.hstack((c2c(points[fId]), virtual_markers[fId])).reshape((-1, 3)), [-90,0,0])
+                linee = np.arange(len(linev)).reshape((-1, 2))
+                ll = Lines(v=linev, e=linee)
+                ll.vc = (ll.v * 0. + 1) * np.array([0.00, 0.00, 1.00])
+                mvs[dispId].set_dynamic_lines([ll])
+                mvs[dispId].set_dynamic_meshes([orig_mrk_mesh, virtual_markers_mesh])
+                mvs[dispId].set_static_meshes([new_body_mesh])
+
+                # draw the body lines between the orginal markers
                 # linev = rotateXYZ(np.hstack((c2c(points[fId]), virtual_markers[fId])).reshape((-1, 3)), [-90,0,0])
                 # linee = np.arange(len(linev)).reshape((-1, 2))
                 # ll = Lines(v=linev, e=linee)
                 # ll.vc = (ll.v * 0. + 1) * np.array([0.00, 0.00, 1.00])
                 # mvs[dispId].set_dynamic_lines([ll])
-
-                # orig_mrk_mesh = points_to_spheres(data_pc, radius=0.01, vc=colors['blue'])
-                mvs[dispId].set_dynamic_meshes([orig_mrk_mesh, virtual_markers_mesh])
-                mvs[dispId].set_static_meshes([new_body_mesh])
+                # mvs[dispId].set_dynamic_meshes([orig_mrk_mesh, virtual_markers_mesh])
+                
+                # mvs[dispId].set_dynamic_meshes([orig_mrk_mesh])
 
             mvs[0].set_titlebar(message)
             # if out_dir is not None: mv.save_snapshot(os.path.join(out_dir, '%05d_it_%.5d.png' %(frame_id, opt_it)))
@@ -139,10 +149,13 @@ def ik_fit(
     source_kpts_model,
     static_vars,
     vp_model,
-    extra_params={},
+    extra_params=None,
     on_step=None,
     gstep=0,
-):    
+):  
+    if extra_params is None:
+        extra_params = {}  
+    
     data_loss = extra_params.get("data_loss", torch.nn.SmoothL1Loss(reduction="mean"))
 
     # data_loss =
@@ -255,11 +268,14 @@ class IK_Engine(nn.Module):
             disable_grad=True,
         )
 
-    def forward(self, source_kpts, target_kpts, initial_body_params={}):
+    def forward(self, source_kpts, target_kpts, initial_body_params=None):
         """
         source_kpts is a function that given body parameters computes source key points that should match target key points
         Try to reconstruct the bps signature by optimizing the body_poZ
         """
+        if initial_body_params is None:
+            initial_body_params = {}
+        
         # if self.rt_ps.verbosity > 0: self.logger('Processing {} frames'.format(points.shape[0]))
         bs = target_kpts.shape[0]
 
@@ -271,6 +287,9 @@ class IK_Engine(nn.Module):
             verbosity=self.verbosity,
             logger=self.logger,
         )
+
+        # if 'pose_body' in initial_body_params and initial_body_params['pose_body'].shape[0] != bs:
+        #     raise ValueError(f"initial_body_params['pose_body'] batch size {initial_body_params['pose_body'].shape[0]} does not match target_kpts batch size {bs}")
 
         comp_device = target_kpts.device
         # comp_device = self.vp_model.named_parameters().__next__()[1].device
@@ -356,4 +375,5 @@ class IK_Engine(nn.Module):
         #     breakpoint()
         #     return None
 
-        return closure.free_vars  # , closure.nonan_mask
+        return closure.free_vars, closure.final_loss
+    

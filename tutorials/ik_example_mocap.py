@@ -91,7 +91,8 @@ comp_device = torch.device("cuda")
 
 sample_amass = np.load(sample_amass_fname, allow_pickle=True)
 
-print("sample_amass keys: ", list(sample_amass.keys()))
+# print("sample_amass keys: ", [(c, sample_amass[c].shape, sample_amass[c].dtype) for c in sample_amass.keys()])
+# exit()
 
 vids = sample_amass["vids"].tolist()
 

@@ -270,7 +270,6 @@ def vertices2joints(J_regressor, vertices):
     torch.tensor BxJx3
         The location of the joints
     '''
-
     return torch.einsum('bik,ji->bjk', [vertices, J_regressor])
 
 
