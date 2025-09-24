@@ -12,16 +12,20 @@ import numpy as np
 import torch
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
+import cv2
 from os import path as osp
 from typing import List, Tuple, Dict
 
 from human_body_prior.body_model.body_model import BodyModel
 from human_body_prior.tools.omni_tools import copy2cpu as c2c
 
+# Configuration
+DEFAULT_BATCH_SIZE = 128  # Adjust based on GPU memory
+MAX_BATCH_SIZE = DEFAULT_BATCH_SIZE     # Maximum batch size to prevent memory issues
+
 # Try to import visualization tools - these may not be available
 try:
     from body_visualizer.tools.vis_tools import render_smpl_params
-    from body_visualizer.tools.vis_tools import imagearray2file
     BODY_VISUALIZER_AVAILABLE = True
 except ImportError:
     BODY_VISUALIZER_AVAILABLE = False
@@ -33,6 +37,42 @@ try:
     IMAGEIO_AVAILABLE = True
 except ImportError:
     IMAGEIO_AVAILABLE = False
+
+
+def determine_optimal_batch_size(device: torch.device, n_frames: int) -> int:
+    """
+    Determine optimal batch size based on available GPU memory and number of frames.
+    
+    Args:
+        device: Torch device
+        n_frames: Total number of frames to render
+        
+    Returns:
+        Optimal batch size
+    """
+    
+    # if device.type == 'cpu':
+    #     return min(DEFAULT_BATCH_SIZE, n_frames)
+    
+    # try:
+    #     # Get GPU memory info
+    #     if hasattr(torch.cuda, 'get_device_properties'):
+    #         gpu_memory_gb = torch.cuda.get_device_properties(device).total_memory / (1024**3)
+            
+    #         # Estimate batch size based on memory
+    #         # Rough estimate: each frame needs ~50MB for rendering
+    #         estimated_batch_size = max(1, int(gpu_memory_gb * 0.3 / 0.05))  # Use 30% of memory
+    #         batch_size = min(estimated_batch_size, MAX_BATCH_SIZE, n_frames)
+    #     else:
+    #         batch_size = min(DEFAULT_BATCH_SIZE, n_frames)
+            
+    #     print(f"Determined optimal batch size: {batch_size}")
+    #     return batch_size
+        
+    # except Exception:
+    #     return min(DEFAULT_BATCH_SIZE, n_frames)
+    
+    return min(DEFAULT_BATCH_SIZE, n_frames)
 
 
 def setup_paths() -> Tuple[str, str, str]:
@@ -216,21 +256,22 @@ def create_joint_video_matplotlib(body_meshes: List[Dict], output_path: str, joi
     plt.close()
 
 
-def create_mesh_video_advanced(body_meshes: List[Dict], bm: BodyModel, output_path: str, device: torch.device) -> None:
+def create_mesh_video_advanced(body_meshes: List[Dict], bm: BodyModel, output_path: str, device: torch.device, batch_size: int = 8) -> None:
     """
-    Create a high-quality mesh rendering video (requires body_visualizer).
+    Create a high-quality mesh rendering video using batch rendering (requires body_visualizer).
     
     Args:
         body_meshes: List of body mesh data
         bm: Body model instance
         output_path: Output video file path
         device: Torch device for computation
+        batch_size: Number of frames to render in each batch
     """
     if not BODY_VISUALIZER_AVAILABLE:
         print("body_visualizer not available. Skipping advanced mesh rendering.")
         return
     
-    print("Creating high-quality mesh video...")
+    print(f"Creating high-quality mesh video with batch rendering (batch_size={batch_size})...")
     
     try:
         # Prepare all body parameters on the correct device
@@ -241,99 +282,148 @@ def create_mesh_video_advanced(body_meshes: List[Dict], bm: BodyModel, output_pa
         
         for key in param_keys:
             param_values = []
-            for i, mesh in enumerate(body_meshes):
+            for mesh in body_meshes:
                 # Convert numpy to tensor and ensure correct device
                 param_tensor = torch.from_numpy(mesh['params'][key]).float().to(device)
+                # Ensure single frame has batch dimension
+                if param_tensor.dim() == 1:
+                    param_tensor = param_tensor.unsqueeze(0)
+                elif param_tensor.dim() == 0:
+                    param_tensor = param_tensor.unsqueeze(0)
                 param_values.append(param_tensor)
-                print(f"Frame {i+1}, {key}: shape {param_tensor.shape}, device {param_tensor.device}")
             
-            # Stack all frames for this parameter
-            all_body_params[key] = torch.stack(param_values)
-            print(f"Stacked {key}: shape {all_body_params[key].shape}")
+            # Stack all frames for this parameter [n_frames, ...]
+            all_body_params[key] = torch.cat(param_values, dim=0)
+            print(f"Prepared {key}: shape {all_body_params[key].shape}")
         
         # Ensure body model is on correct device
         bm = bm.to(device)
         
-        # Render all frames
-        print("Rendering frames...")
+        # Initialize video writer for streaming
+        FPS = 30  # Frames per second for video
+        # Get image dimensions from first render to initialize video writer
+        print("Initializing video writer...")
         
-        # Render frames individually to avoid memory issues
-        rendered_images = []
-        for frame_idx in range(len(body_meshes)):
-            # Extract single frame parameters and ensure correct dimensionality
-            frame_params = {}
-            for key, val in all_body_params.items():
-                # Extract single frame and ensure it has batch dimension
-                frame_tensor = val[frame_idx]  # Remove frame dimension
-                if frame_tensor.dim() == 1:
-                    frame_tensor = frame_tensor.unsqueeze(0)  # Add batch dimension [1, ...]
-                elif frame_tensor.dim() == 0:
-                    frame_tensor = frame_tensor.unsqueeze(0).unsqueeze(0)  # Add batch and feature dim [1, 1]
-                
-                frame_params[key] = frame_tensor
-                
-            print(f"Rendering frame {frame_idx+1}/{len(body_meshes)}")
-            print(f"  Frame params shapes: {[(k, v.shape) for k, v in frame_params.items()]}")
-            
-            # Render single frame
-            frame_image = render_smpl_params(bm, frame_params, rot_body=[0, 180, 0])
-            
-            # Convert to numpy and store
-            if isinstance(frame_image, torch.Tensor):
-                frame_image = frame_image.cpu().numpy()
-            
-            rendered_images.append(frame_image)
+        # Render first frame to get dimensions
+        first_batch_params = {}
+        for key, val in all_body_params.items():
+            first_batch_params[key] = val[0:1]  # Just first frame
+
+        rotation = [-110, 160, 0]
+
+        first_frame = render_smpl_params(bm, first_batch_params, rot_body=rotation)
+        if isinstance(first_frame, torch.Tensor):
+            first_frame = first_frame.cpu().numpy()
         
-        print(f"Successfully rendered {len(rendered_images)} frames")
-        
-        FPS = 5  # Frames per second for video
-        
-        # Save as video using imageio
-        if IMAGEIO_AVAILABLE:
-            # Stack and reshape images for video
-            video_frames = []
-            for img in rendered_images:
-                if img.ndim == 5:  # [1, 1, 1, H, W, 3]
-                    img = img[0, 0, 0]  # Remove batch dimensions
-                elif img.ndim == 4:  # [1, H, W, 3]
-                    img = img[0]
-                
-                # Ensure image is in correct format [H, W, 3]
-                if img.shape[-1] == 3:
-                    # Convert to uint8 if needed
-                    if img.dtype != np.uint8:
-                        img = (img * 255).astype(np.uint8)
-                    video_frames.append(img)
-            
-            if video_frames:
-                print(f"Saving video to {output_path}...")
-                if output_path.lower().endswith('.mp4'):
-                    # MP4 format doesn't support loop parameter
-                    imageio.mimsave(output_path, video_frames, fps=FPS)
-                else:
-                    # GIF format supports loop parameter
-                    imageio.mimsave(output_path, video_frames, fps=FPS, loop=0)
-                print("Advanced mesh video saved successfully!")
-            else:
-                print("No valid frames to save")
+        # Get image dimensions
+        if first_frame.ndim == 4:  # [1, H, W, 3]
+            img_h, img_w = first_frame.shape[1], first_frame.shape[2]
+            sample_frame = first_frame[0]
         else:
-            # Fallback: save individual frames
-            print("imageio not available, saving individual frames...")
-            for i, img in enumerate(rendered_images):
-                frame_path = output_path.replace('.mp4', f'_frame_{i:03d}.png')
-                if img.ndim == 5:
-                    img = img[0, 0, 0]
-                elif img.ndim == 4:
-                    img = img[0]
-                
-                # Save using matplotlib
-                plt.figure(figsize=(8, 8))
-                plt.imshow(img)
-                plt.axis('off')
-                plt.savefig(frame_path, bbox_inches='tight', dpi=150)
-                plt.close()
+            img_h, img_w = first_frame.shape[0], first_frame.shape[1]
+            sample_frame = first_frame
+        
+        print(f"Video dimensions: {img_w}x{img_h}")
+        
+        # Initialize video writer
+        video_writer = None
+        if output_path.lower().endswith('.mp4'):
+            import cv2
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            video_writer = cv2.VideoWriter(output_path, fourcc, FPS, (img_w, img_h))
             
-            print(f"Saved {len(rendered_images)} individual frame images")
+            # Write the first frame
+            frame = sample_frame
+            if frame.dtype != np.uint8:
+                frame = (frame * 255).astype(np.uint8)
+            frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            video_writer.write(frame_bgr)
+            print("Video writer initialized successfully")
+        
+        # Render remaining frames in batches and stream to file
+        print("Rendering and streaming frames in batches...")
+        n_frames = len(body_meshes)
+        n_batches = (n_frames + batch_size - 1) // batch_size
+        frames_written = 1  # Already wrote first frame
+        
+        for batch_idx, batch_start in enumerate(range(batch_size, n_frames, batch_size)):
+            batch_end = min(batch_start + batch_size, n_frames)
+            current_batch_size = batch_end - batch_start
+            
+            print(f"Rendering batch {batch_idx + 2}/{n_batches}: frames {batch_start+1}-{batch_end} ({current_batch_size} frames)")
+            
+            # Extract batch parameters
+            batch_params = {}
+            for key, val in all_body_params.items():
+                batch_params[key] = val[batch_start:batch_end]
+            
+            # Render entire batch at once
+            batch_images = render_smpl_params(bm, batch_params, rot_body=rotation)
+            
+            # Convert to numpy if needed
+            if isinstance(batch_images, torch.Tensor):
+                batch_images = batch_images.cpu().numpy()
+            
+            # Stream frames directly to video file
+            if batch_images.ndim == 4:  # [batch_size, H, W, 3]
+                for i in range(current_batch_size):
+                    frame = batch_images[i]
+                    if frame.dtype != np.uint8:
+                        frame = (frame * 255).astype(np.uint8)
+                    
+                    if video_writer is not None:
+                        frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                        video_writer.write(frame_bgr)
+                        frames_written += 1
+            else:
+                print(f"Unexpected batch image shape: {batch_images.shape}")
+            
+            # Clear memory after each batch
+            del batch_images
+            if device.type == 'cuda':
+                torch.cuda.empty_cache()
+                
+            print(f"  Completed batch {batch_idx + 2}/{n_batches} ({frames_written} total frames written)")
+        
+        # Close video writer
+        if video_writer is not None:
+            video_writer.release()
+            print(f"Successfully streamed {frames_written} frames to video file")
+        else:
+            # Fallback for non-MP4 formats - use imageio but still stream
+            print("Using imageio fallback for non-MP4 format...")
+            if IMAGEIO_AVAILABLE:
+                with imageio.get_writer(output_path, mode='I', fps=FPS) as writer:
+                    # Re-render frames and write directly to avoid memory accumulation
+                    for batch_idx, batch_start in enumerate(range(0, n_frames, batch_size)):
+                        batch_end = min(batch_start + batch_size, n_frames)
+                        
+                        batch_params = {}
+                        for key, val in all_body_params.items():
+                            batch_params[key] = val[batch_start:batch_end]
+                        
+                        batch_images = render_smpl_params(bm, batch_params, rot_body=[-90,0,0])
+                        if isinstance(batch_images, torch.Tensor):
+                            batch_images = batch_images.cpu().numpy()
+                        
+                        if batch_images.ndim == 4:
+                            for i in range(batch_end - batch_start):
+                                frame = batch_images[i]
+                                if frame.dtype != np.uint8:
+                                    frame = (frame * 255).astype(np.uint8)
+                                writer.append_data(frame)
+                        
+                        del batch_images
+                        if device.type == 'cuda':
+                            torch.cuda.empty_cache()
+                        
+                        print(f"Streamed batch {batch_idx + 1}/{n_batches}")
+                
+                print("Video saved successfully with imageio!")
+            else:
+                print("Neither OpenCV nor imageio available for video writing")
+        
+        print("Advanced mesh video created with streaming - minimal memory usage!")
         
     except Exception as e:
         print(f"Advanced rendering failed with error: {e}")
@@ -421,8 +511,8 @@ def main():
     body_meshes = create_body_meshes(results, bm, device)
     
     # Create visualizations
-    video_path = osp.join(output_dir, 'parkinson_motion_joints.gif')
-    create_joint_video_matplotlib(body_meshes, video_path, joint_mapping)
+    # video_path = osp.join(output_dir, 'parkinson_motion_joints.gif')
+    # create_joint_video_matplotlib(body_meshes, video_path, joint_mapping)
     
     # Analyze joint movement
     analyze_joint_movement(body_meshes, joint_mapping, output_dir)
@@ -430,10 +520,12 @@ def main():
     # Try advanced mesh rendering if available
     if BODY_VISUALIZER_AVAILABLE:
         mesh_video_path = osp.join(output_dir, 'parkinson_motion_mesh.mp4')
-        create_mesh_video_advanced(body_meshes, bm, mesh_video_path, device)
+        # Determine optimal batch size
+        batch_size = determine_optimal_batch_size(device, len(body_meshes))
+        create_mesh_video_advanced(body_meshes, bm, mesh_video_path, device, batch_size)
     
     print(f"\nVisualization complete! Check the '{output_dir}' directory for outputs:")
-    print(f"  - Joint motion video: {video_path}")
+    # print(f"  - Joint motion video: {video_path}")
     print(f"  - Loss trajectory: {osp.join(output_dir, 'loss_trajectory.png')}")
     print(f"  - Movement analysis: {osp.join(output_dir, 'joint_movement_analysis.png')}")
     if BODY_VISUALIZER_AVAILABLE:

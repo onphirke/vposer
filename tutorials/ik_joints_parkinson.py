@@ -104,7 +104,8 @@ def setup_paths() -> Tuple[str, str, str]:
     support_dir = "../support_data/dowloads"
     vposer_expr_dir = "../_good_runs/V02_05"  # VPoser model directory
     bm_fname = osp.join(support_dir, "models/smplx/neutral/model.npz")  # SMPL-X model
-    target_pts_file = "../_data/patient_motion_full.csv"  # Patient motion data
+    # target_pts_file = "../_data/patient_motion_full.csv"  # Patient motion data
+    target_pts_file = "../_data/patient_motion_3d.csv"  # Patient motion data
 
     return vposer_expr_dir, bm_fname, target_pts_file
 
@@ -213,32 +214,50 @@ def create_joint_mapping_candidates(
     Returns:
         List of candidate mapping dictionaries {csv_name: smpl_name}
     """
+    # # Define semantic mappings based on common naming patterns
+    # semantic_mappings = {
+    #     # Head and neck
+    #     "head": ["head"],
+    #     "neck": ["neck"],
+    #     # Torso
+    #     "hip_center": ["pelvis"],
+    #     "spine": ["spine1"],
+    #     # Left side
+    #     "hip_L": ["left_hip"],
+    #     "knee_L": ["left_knee"],
+    #     "ankle_L": ["left_ankle"],
+    #     "foot_L": ["left_foot"],
+    #     "shoulder_L": ["left_shoulder"],
+    #     "elbow_L": ["left_elbow"],
+    #     "wrist_L": ["left_wrist"],
+    #     # "hand_L": ["left_hand"],
+    #     # Right side
+    #     "hip_R": ["right_hip"],
+    #     "knee_R": ["right_knee"],
+    #     "ankle_R": ["right_ankle"],
+    #     "foot_R": ["right_foot"],
+    #     "shoulder_R": ["right_shoulder"],
+    #     "elbow_R": ["right_elbow"],
+    #     "wrist_R": ["right_wrist"],
+    #     # "hand_R": ["right_hand"],
+    # }
+
     # Define semantic mappings based on common naming patterns
     semantic_mappings = {
-        # Head and neck
+        # Head and Torso
+        "pelvis": ["pelvis"],
         "head": ["head"],
-        "neck": ["neck"],
-        # Torso
-        "hip_center": ["pelvis"],
-        "spine": ["spine1"],
-        # Left side
-        "hip_L": ["left_hip"],
-        "knee_L": ["left_knee"],
-        "ankle_L": ["left_ankle"],
-        "foot_L": ["left_foot"],
-        "shoulder_L": ["left_shoulder"],
-        "elbow_L": ["left_elbow"],
-        "wrist_L": ["left_wrist"],
-        # "hand_L": ["left_hand"],
-        # Right side
-        "hip_R": ["right_hip"],
-        "knee_R": ["right_knee"],
-        "ankle_R": ["right_ankle"],
-        "foot_R": ["right_foot"],
-        "shoulder_R": ["right_shoulder"],
-        "elbow_R": ["right_elbow"],
-        "wrist_R": ["right_wrist"],
-        # "hand_R": ["right_hand"],
+        "chest": ["spine3"],  # Mapping 'chest' to 'spine2' as a common chest-level joint
+        # Left Side
+        "l_hip": ["left_hip"],
+        "l_knee": ["left_knee"],
+        "l_ankle": ["left_ankle"],
+        "l_wrist": ["left_wrist"],
+        # Right Side
+        "r_hip": ["right_hip"],
+        "r_knee": ["right_knee"],
+        "r_ankle": ["right_ankle"],
+        "r_wrist": ["right_wrist"],
     }
 
     candidates = []
@@ -667,8 +686,9 @@ def main():
 
     # Discover the best joint mapping between CSV and SMPL
     results = []
-    batch_size = 300
-    num_frames = 300
+    num_frames = len(pd.read_csv(target_pts_file))
+    batch_size = num_frames
+    print(f"Total frames in data: {num_frames}")
 
     # Process frames in batches
     for frame_ids in create_list_chunks(
