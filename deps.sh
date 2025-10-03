@@ -2,7 +2,7 @@
 
 # install system dependencies
 sudo apt-get update
-sudo apt-get install libgl1-mesa-glx libglu1-mesa freeglut3-dev
+sudo apt-get install libgl1 libglx-mesa0 libglu1-mesa freeglut3-dev
 
 # check that we have uv installed
 if ! command -v uv &> /dev/null
@@ -23,4 +23,3 @@ if [ ! -d ".venv" ]; then
     # install this package in develop mode
     uv run setup.py develop
 fi
-

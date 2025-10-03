@@ -102,10 +102,12 @@ def setup_paths() -> Tuple[str, str, str]:
         Tuple of (vposer_expr_dir, bm_fname, target_pts_file)
     """
     support_dir = "../support_data/dowloads"
-    vposer_expr_dir = "../_good_runs/V02_05"  # VPoser model directory
+    # vposer_expr_dir = "../_good_runs/V02_05"  # VPoser model directory
+    vposer_expr_dir = "../_good_runs/V_me_all"  # VPoser model directory
     bm_fname = osp.join(support_dir, "models/smplx/neutral/model.npz")  # SMPL-X model
     # target_pts_file = "../_data/patient_motion_full.csv"  # Patient motion data
-    target_pts_file = "../_data/patient_motion_3d.csv"  # Patient motion data
+    # target_pts_file = "../_data/patient_motion_3d.csv"  # Patient motion data
+    target_pts_file = "../_data/data.csv"  # Patient motion data
 
     return vposer_expr_dir, bm_fname, target_pts_file
 
@@ -154,11 +156,24 @@ def get_csv_joint_names(target_pts_file: str) -> List[str]:
     target_pts_df = pd.read_csv(target_pts_file)
 
     # Extract unique joint names from column headers (remove _x, _y, _z suffixes)
-    point_names = list(
-        {"_".join(s.split("_")[:-1]): None for s in target_pts_df.columns}.keys()
-    )
+    relevant_cols = [
+        c
+        for c in target_pts_df.columns
+        if (len(c) >= 2 and c[-2:] in ["_x", "_y", "_z"])
+    ]
+    groups = {}
+    for rc in relevant_cols:
+        group_name = "_".join(rc.split("_")[:-1])
+        groups.setdefault(group_name, []).append(rc)
+    joint_names = [j for j in groups.keys() if len(groups[j]) == 3]
+    joint_names.sort()
 
-    return sorted(point_names)  # Sort for consistency
+    # joint_names = list(
+    #     {"_".join(s.split("_")[:-1]): None for s in target_pts_df.columns}.keys()
+    # )
+    # joint_names.sort()
+
+    return joint_names
 
 
 def get_smpl_joint_names() -> List[str]:
@@ -243,21 +258,41 @@ def create_joint_mapping_candidates(
     # }
 
     # Define semantic mappings based on common naming patterns
+    # semantic_mappings = {
+    #     # Head and Torso
+    #     "pelvis": ["pelvis"],
+    #     "head": ["head"],
+    #     "chest": ["spine3"],  # Mapping 'chest' to 'spine2' as a common chest-level joint
+    #     # Left Side
+    #     "l_hip": ["left_hip"],
+    #     "l_knee": ["left_knee"],
+    #     "l_ankle": ["left_ankle"],
+    #     "l_wrist": ["left_wrist"],
+    #     # Right Side
+    #     "r_hip": ["right_hip"],
+    #     "r_knee": ["right_knee"],
+    #     "r_ankle": ["right_ankle"],
+    #     "r_wrist": ["right_wrist"],
+    # }
+
+    # third version
+    # with these keys:  'Forehead', 'L_Ankle', 'L_DorsalFoot', 'L_LatShank', 'L_MidLatThigh', 'L_Wrist', 'LowerBack', 'Pelvis', 'R_Ankle', 'R_DorsalFoot', 'R_LatShank', 'R_MidLatThigh', 'R_Wrist', 'Xiphoid'
+
     semantic_mappings = {
-        # Head and Torso
-        "pelvis": ["pelvis"],
-        "head": ["head"],
-        "chest": ["spine3"],  # Mapping 'chest' to 'spine2' as a common chest-level joint
-        # Left Side
-        "l_hip": ["left_hip"],
-        "l_knee": ["left_knee"],
-        "l_ankle": ["left_ankle"],
-        "l_wrist": ["left_wrist"],
-        # Right Side
-        "r_hip": ["right_hip"],
-        "r_knee": ["right_knee"],
-        "r_ankle": ["right_ankle"],
-        "r_wrist": ["right_wrist"],
+        "Forehead": ["head"],
+        "L_Ankle": ["left_ankle"],
+        "L_DorsalFoot": ["left_foot"],
+        "L_LatShank": ["left_knee"],
+        "L_MidLatThigh": ["left_hip"],
+        "L_Wrist": ["left_wrist"],
+        "LowerBack": ["spine1"],
+        "Pelvis": ["pelvis"],
+        "R_Ankle": ["right_ankle"],
+        "R_DorsalFoot": ["right_foot"],
+        "R_LatShank": ["right_knee"],
+        "R_MidLatThigh": ["right_hip"],
+        "R_Wrist": ["right_wrist"],
+        "Xiphoid": ["spine3"],
     }
 
     candidates = []

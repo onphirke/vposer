@@ -81,12 +81,14 @@ class SourceKeyPoints(nn.Module):
 
 support_dir = "../support_data/dowloads"
 # vposer_expr_dir = osp.join(support_dir,'V02_05')
-vposer_expr_dir = "../_data/_runs/V_me_all"
+vposer_expr_dir = "../_good_runs/V_me_all"
+# vposer_expr_dir = "../_data/_runs/V_me_all"
 bm_fname = osp.join(support_dir, "models/smplx/neutral/model.npz")
 sample_amass_fname = osp.join(support_dir, "amass_sample.npz")
 
 
-comp_device = torch.device("cuda")
+# comp_device = torch.device("cuda")
+comp_device = torch.device("cpu")
 
 
 sample_amass = np.load(sample_amass_fname, allow_pickle=True)
