@@ -1,0 +1,52 @@
+======================================================================
+Example Marker-Based IK Workflow
+======================================================================
+
+----------------------------------------------------------------------
+Step 1: Creating marker definitions
+----------------------------------------------------------------------
+Created 10 markers:
+  head_top: vertex 411
+  neck: vertex 3050
+  left_shoulder: vertex 3023
+  right_shoulder: vertex 6470
+  left_elbow: vertex 1666
+  right_elbow: vertex 5111
+  left_wrist: vertex 2112
+  right_wrist: vertex 5559
+  chest: vertex 3500
+  pelvis: vertex 3143
+
+Saved marker definitions to example_markers.npz
+
+----------------------------------------------------------------------
+Step 2: Generating synthetic motion
+----------------------------------------------------------------------
+Generating 30 frames of synthetic motion...
+
+----------------------------------------------------------------------
+Step 3: Extracting marker positions (simulating mocap)
+----------------------------------------------------------------------
+Extracting marker positions from body model...
+Traceback (most recent call last):
+  File "example_workflow.py", line 281, in <module>
+    run_example_workflow()
+  File "example_workflow.py", line 190, in run_example_workflow
+    target_markers = extract_marker_positions(body_params_gt, marker_indices, body_model_path)
+  File "example_workflow.py", line 112, in extract_marker_positions
+    body_output = bm(
+  File "/home/ojas/research/vposer/.venv/lib/python3.8/site-packages/torch/nn/modules/module.py", line 1553, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/ojas/research/vposer/.venv/lib/python3.8/site-packages/torch/nn/modules/module.py", line 1562, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/ojas/research/vposer/MAIN/../src/human_body_prior/body_model/body_model.py", line 257, in forward
+    verts, Jtr = lbs(betas=shape_components, pose=full_pose, v_template=v_template,
+  File "/home/ojas/research/vposer/MAIN/../src/human_body_prior/body_model/lbs.py", line 209, in lbs
+    v_shaped = v_template + blend_shapes(betas, shapedirs)
+  File "/home/ojas/research/vposer/MAIN/../src/human_body_prior/body_model/lbs.py", line 298, in blend_shapes
+    blend_shape = torch.einsum('bl,mkl->bmk', [betas, shape_disps])
+  File "/home/ojas/research/vposer/.venv/lib/python3.8/site-packages/torch/functional.py", line 381, in einsum
+    return einsum(equation, *_operands)
+  File "/home/ojas/research/vposer/.venv/lib/python3.8/site-packages/torch/functional.py", line 386, in einsum
+    return _VF.einsum(equation, operands)  # type: ignore[attr-defined]
+RuntimeError: expected scalar type Float but found Double
