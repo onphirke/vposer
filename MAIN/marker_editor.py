@@ -225,7 +225,7 @@ class MarkerEditor:
         print("="*70)
         
         # Create mesh viewer
-        mv = MeshViewer()
+        mv = MeshViewer(keepalive=False)
         
         # Create body mesh
         body_mesh = Mesh(v=self.vertices, f=self.faces, vc=colors['grey'])
@@ -270,6 +270,14 @@ class MarkerEditor:
                 pos = self.marker_positions[name]
                 print(f"  {name}: vertex {idx} at ({pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f})")
             return [name for name in self.markers]
+        
+        def clean_default_names():
+            """Remove markers with default names."""
+            to_delete = [name for name in self.markers if name.startswith("marker_")]
+            for name in to_delete:
+                self.delete_marker(name)
+            self._update_viewer(mv)
+            print(f"Deleted {len(to_delete)} default-named markers.")
         
         def quit_editor():
             """Exit the editor."""

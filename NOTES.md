@@ -20,3 +20,21 @@ On WSL2g, have to use `PYOPENGL_PLATFORM=glx` for correctness
 
 
 image labels retrieved from https://www.researchgate.net/publication/391284907_A_Method_for_Redirecting_Humanoid_Robots_Based_on_Segmented_Geometric_Inverse_Kinematics
+
+
+
+
+--- 
+---
+---
+---
+
+
+Betas encode the shape (skin params). we don't need to optimize these since we are assuming normal body shape
+
+smplx body model is parameterized by 165 params
+
+vposer compresses the body pose of 63 params (21 joints * 3) to a latent space (default is dim 32 in this code)
+
+through this, it learns valid poses
+

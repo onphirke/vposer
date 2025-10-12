@@ -100,6 +100,8 @@ def visualize(points, bm_f, mvs, kpts_colors, verbosity=2, logger=None):
                 ll = Lines(v=linev, e=linee)
                 ll.vc = (ll.v * 0. + 1) * np.array([0.00, 0.00, 1.00])
                 mvs[dispId].set_dynamic_lines([ll])
+                # mvs[dispId].set_dynamic_meshes([orig_mrk_mesh, virtual_markers_mesh, new_body_mesh])
+                # mvs[dispId].set_static_meshes([orig_mrk_mesh, virtual_markers_mesh, new_body_mesh])
                 mvs[dispId].set_dynamic_meshes([orig_mrk_mesh, virtual_markers_mesh])
                 mvs[dispId].set_static_meshes([new_body_mesh])
 

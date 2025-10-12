@@ -21,6 +21,8 @@ pandas
 
 pyglet
 
+pydantic
+
 imageio[ffmpeg]
 
 git+https://github.com/nghorbani/body_visualizer
