@@ -34,6 +34,7 @@ import argparse
 import numpy as np
 import torch
 from typing import Optional
+import pytorch3d.structures as pd3d_structures
 
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
@@ -43,6 +44,7 @@ from human_body_prior.body_model.body_model import BodyModel
 # Import visualization tools - psbody mesh is required
 try:
     from psbody.mesh import Mesh, MeshViewer
+    from psbody.mesh.lines import Lines
     from body_visualizer.tools.vis_tools import colors
     PSBODY_AVAILABLE = True
 except ImportError:
@@ -50,6 +52,34 @@ except ImportError:
     print("Please install it to use the marker editor.")
     PSBODY_AVAILABLE = False
     sys.exit(1)
+
+
+def compute_vertex_normal_batched(v, f):
+    """Compute vertex normals for a batch of vertices using PyTorch3D."""
+    return (
+        pd3d_structures.Meshes(verts=v, faces=f.expand(len(v), -1, -1))
+        .verts_normals_packed()
+        .view(-1, v.shape[1], 3)
+    )
+
+
+def create_normal_lines(vertices, normals, length=0.02, color=None):
+    """Create Lines object for rendering vertex normals."""
+    if color is None:
+        color = colors['blue']
+    
+    # Create line vertices (start and end points)
+    n_verts = vertices.shape[0]
+    lines_v = np.zeros((n_verts * 2, 3))
+    lines_v[::2] = vertices  # Start points
+    lines_v[1::2] = vertices + length * normals  # End points
+    
+    # Create line edges
+    lines_e = np.array([[i, i + 1] for i in range(0, n_verts * 2, 2)], dtype=np.int32)
+    
+    lines = Lines(v=lines_v, e=lines_e)
+    lines.vc = (lines.v * 0.0 + 1) * np.array(color)
+    return lines
 
 
 class MarkerEditor:
@@ -67,6 +97,7 @@ class MarkerEditor:
         self.output_file = output_file
         self.markers = {}  # {name: vertex_index}
         self.marker_positions = {}  # {name: (x, y, z)}
+        self.marker_orients = {}  # {name: vertex_index} - optional orientation targets
         self.temp_marker_count = 0
         
         # Initialize body model
@@ -86,8 +117,19 @@ class MarkerEditor:
         self.vertices = body_output.v.cpu().numpy()[0]
         self.faces = self.bm.f.cpu().numpy() if hasattr(self.bm, 'f') else self.bm.faces
         
+        # Compute vertex normals
+        self._compute_vertex_normals()
+        
         print(f"Body model loaded: {self.vertices.shape[0]} vertices, {self.faces.shape[0]} faces")
         print(f"Device: {self.device}")
+    
+    def _compute_vertex_normals(self):
+        """Compute vertex normals for the body mesh."""
+        vertices_torch = torch.tensor(self.vertices, dtype=torch.float32).unsqueeze(0).to(self.device)
+        faces_torch = torch.tensor(self.faces, dtype=torch.long).to(self.device)
+        
+        normals = compute_vertex_normal_batched(vertices_torch, faces_torch)
+        self.vertex_normals = normals.cpu().numpy()[0]
     
     def find_closest_vertex(self, point: np.ndarray) -> int:
         """
@@ -137,9 +179,72 @@ class MarkerEditor:
         if name in self.markers:
             self.markers.pop(name)
             self.marker_positions.pop(name)
+            if name in self.marker_orients:
+                self.marker_orients.pop(name)
             print(f"Deleted marker '{name}'")
         else:
             print(f"Warning: Marker '{name}' not found")
+    
+    def set_orient(self, marker_name: str, target_vertex_idx: int):
+        """
+        Set orientation for a marker.
+        
+        Args:
+            marker_name: Name of the marker to orient
+            target_vertex_idx: Vertex index that the marker should be oriented towards
+        """
+        if marker_name not in self.markers:
+            print(f"Error: Marker '{marker_name}' not found")
+            return
+        
+        self.marker_orients[marker_name] = target_vertex_idx
+        print(f"Set orientation for '{marker_name}' towards vertex {target_vertex_idx}")
+    
+    def get_marker_normal(self, marker_name: str) -> Optional[np.ndarray]:
+        """Get the vertex normal for a marker."""
+        if marker_name not in self.markers:
+            print(f"Error: Marker '{marker_name}' not found")
+            return None
+        
+        vertex_idx = self.markers[marker_name]
+        return self.vertex_normals[vertex_idx]
+    
+    def get_orient_vector_projected(self, marker_name: str) -> Optional[np.ndarray]:
+        """
+        Get the orientation vector projected onto the marker's normal plane.
+        
+        Args:
+            marker_name: Name of the marker
+        
+        Returns:
+            Projected orientation vector (perpendicular to normal), or None if no orientation set
+        """
+        if marker_name not in self.marker_orients:
+            return None
+        
+        marker_idx = self.markers[marker_name]
+        target_idx = self.marker_orients[marker_name]
+        
+        # Get marker position and normal
+        marker_pos = self.vertices[marker_idx]
+        marker_normal = self.vertex_normals[marker_idx]
+        
+        # Get target position
+        target_pos = self.vertices[target_idx]
+        
+        # Compute direction vector from marker to target
+        orient_vec = target_pos - marker_pos
+        orient_vec = orient_vec / (np.linalg.norm(orient_vec) + 1e-8)  # Normalize
+        
+        # Project onto the normal plane: v_proj = v - (v·n)n
+        orient_projected = orient_vec - np.dot(orient_vec, marker_normal) * marker_normal
+        
+        # Normalize the projected vector
+        norm = np.linalg.norm(orient_projected)
+        if norm > 1e-8:
+            orient_projected = orient_projected / norm
+        
+        return orient_projected
     
     def save_markers(self, filepath: Optional[str] = None):
         """
@@ -160,12 +265,19 @@ class MarkerEditor:
         marker_indices = np.array([self.markers[name] for name in marker_names], dtype=np.int32)
         marker_coords = np.array([self.marker_positions[name] for name in marker_names], dtype=np.float32)
         
+        # Prepare orientation data (use -1 for markers without orientation)
+        marker_orient_indices = np.array(
+            [self.marker_orients.get(name, -1) for name in marker_names], 
+            dtype=np.int32
+        )
+        
         # Save to NPZ
         np.savez(
             filepath,
             marker_names=marker_names,
             marker_indices=marker_indices,
             marker_positions=marker_coords,
+            marker_orients=marker_orient_indices,
             model_path=self.model_path
         )
         
@@ -174,7 +286,10 @@ class MarkerEditor:
         for name in marker_names:
             idx = self.markers[name]
             pos = self.marker_positions[name]
-            print(f"  {name}: vertex {idx} at ({pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f})")
+            orient_info = ""
+            if name in self.marker_orients:
+                orient_info = f" -> orient: vertex {self.marker_orients[name]}"
+            print(f"  {name}: vertex {idx} at ({pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f}){orient_info}")
     
     def load_markers(self, filepath: str):
         """
@@ -192,16 +307,27 @@ class MarkerEditor:
         marker_names = data['marker_names'].tolist()
         marker_indices = data['marker_indices']
         
+        # Load orientations if available (backwards compatible)
+        marker_orient_indices = data.get('marker_orients', np.array([-1] * len(marker_names)))
+        
         self.markers = {}
         self.marker_positions = {}
+        self.marker_orients = {}
         
-        for name, idx in zip(marker_names, marker_indices):
-            self.markers[name] = int(idx)
+        for i, name in enumerate(marker_names):
+            idx = int(marker_indices[i])
+            self.markers[name] = idx
             self.marker_positions[name] = self.vertices[idx].copy()
+            
+            # Add orientation if specified (not -1)
+            if marker_orient_indices[i] >= 0:
+                self.marker_orients[name] = int(marker_orient_indices[i])
         
         self.temp_marker_count = len(self.markers)
         
         print(f"Loaded {len(self.markers)} markers from {filepath}")
+        if self.marker_orients:
+            print(f"  ({len(self.marker_orients)} markers have orientations)")
     
     def run_psbody_interactive(self):
         """Run interactive editor using psbody.mesh."""
@@ -209,17 +335,26 @@ class MarkerEditor:
         print("Interactive Marker Editor")
         print("="*70)
         print("Commands (type in console):")
-        print("  add(x, y, z)          - Add marker at position (x, y, z)")
-        print("  add_vertex(idx)       - Add marker at vertex index")
-        print("  rename('old', 'new')  - Rename marker")
-        print("  delete('name')        - Delete marker")
-        print("  save()                - Save markers to file")
-        print("  list()                - List all markers")
-        print("  quit()                - Exit editor")
+        print("  add(x, y, z)               - Add marker at position (x, y, z)")
+        print("  add_vertex(idx)            - Add marker at vertex index")
+        print("  orient('marker', vertex)   - Set orientation for marker")
+        print("  rename('old', 'new')       - Rename marker")
+        print("  delete('name')             - Delete marker")
+        print("  save()                     - Save markers to file")
+        print("  list()                     - List all markers")
+        print("  quit()                     - Exit editor")
+        print("")
+        print("Visualization:")
+        print("  Red spheres  = Markers")
+        print("  Blue lines   = Vertex normals")
+        print("  Green lines  = Orientation vectors (projected on normal plane)")
         print("="*70)
         
         # Create mesh viewer
         mv = MeshViewer(keepalive=False)
+        
+        # Set white background
+        mv.set_background_color(colors['white'])
         
         # Create body mesh
         body_mesh = Mesh(v=self.vertices, f=self.faces, vc=colors['grey'])
@@ -245,6 +380,11 @@ class MarkerEditor:
             self.rename_marker(old_name, new_name)
             self._update_viewer(mv)
         
+        def orient(marker_name: str, target_vertex_idx: int):
+            """Set orientation for a marker."""
+            self.set_orient(marker_name, target_vertex_idx)
+            self._update_viewer(mv)
+        
         def delete(name: str):
             """Delete a marker."""
             self.delete_marker(name)
@@ -262,7 +402,10 @@ class MarkerEditor:
             print("\nCurrent markers:")
             for name, idx in self.markers.items():
                 pos = self.marker_positions[name]
-                print(f"  {name}: vertex {idx} at ({pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f})")
+                orient_info = ""
+                if name in self.marker_orients:
+                    orient_info = f" -> orient: vertex {self.marker_orients[name]}"
+                print(f"  {name}: vertex {idx} at ({pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f}){orient_info}")
             return [name for name in self.markers]
         
         def clean_default_names():
@@ -299,23 +442,61 @@ class MarkerEditor:
         code.interact(local=locals(), banner="")
     
     def _update_viewer(self, mv):
-        """Update the mesh viewer with current markers."""
+        """Update the mesh viewer with current markers, normals, and orientations."""
         from psbody.mesh.sphere import Sphere
         
         # Create marker spheres
         marker_meshes = []
+        normal_lines = []
+        orient_lines = []
+        
         for name, idx in self.markers.items():
             pos = self.marker_positions[name]
-            sphere = Sphere(center=pos, radius=0.02).to_mesh()
+            
+            # Create marker sphere
+            sphere = Sphere(center=pos, radius=0.01).to_mesh()
             sphere.vc = np.array([1.0, 0.0, 0.0])  # Red markers
             marker_meshes.append(sphere)
+            
+            # Create normal line (blue)
+            normal = self.vertex_normals[idx]
+            normal_line = create_normal_lines(
+                pos.reshape(1, 3), 
+                normal.reshape(1, 3), 
+                length=0.05, 
+                color=colors['blue']
+            )
+            normal_lines.append(normal_line)
+            
+            # Create orientation line (green) if orientation is set
+            if name in self.marker_orients:
+                orient_projected = self.get_orient_vector_projected(name)
+                if orient_projected is not None:
+                    orient_line = create_normal_lines(
+                        pos.reshape(1, 3), 
+                        orient_projected.reshape(1, 3), 
+                        length=0.05, 
+                        color=colors['green']
+                    )
+                    orient_lines.append(orient_line)
         
-        # Update dynamic meshes
+        # Combine all lines
+        all_lines = normal_lines + orient_lines
+        
+        # Update dynamic meshes (spheres) and lines separately
         if marker_meshes:
             mv.set_dynamic_meshes(marker_meshes)
+        else:
+            mv.set_dynamic_meshes([])
+        
+        if all_lines:
+            mv.set_dynamic_lines(all_lines)
+        else:
+            mv.set_dynamic_lines([])
         
         # Update title
-        mv.set_titlebar(f"Marker Editor - {len(self.markers)} markers")
+        orient_count = len(self.marker_orients)
+        mv.set_titlebar(f"Marker Editor - {len(self.markers)} markers ({orient_count} oriented)")
 
 
 def main():

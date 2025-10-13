@@ -15,6 +15,7 @@ import time
 import code
 import pandas as pd
 
+
 import pytorch3d.structures as pd3d_structures
 from pytorch3d.transforms import quaternion_apply, quaternion_to_matrix
 
@@ -27,6 +28,7 @@ from human_body_prior.models.vposer_model import VPoser
 from human_body_prior.tools.model_loader import load_model
 from human_body_prior.tools.omni_tools import copy2cpu as c2c
 from human_body_prior.tools.omni_tools import flatten_list, log2file
+from human_body_prior.tools.angle_continuous_repres import geodesic_loss_R
 
 can_display = True
 
@@ -117,7 +119,7 @@ def _mesh_to_vertex_normal_lines(
 
 
 class Visualizer:
-    def __init__(self, rows=1, cols=1, keepalive=True):
+    def __init__(self, rows=1, cols=1, keepalive=True, draw_faces=False):
         if not can_display:
             print("Visualization not available")
             return
@@ -128,6 +130,7 @@ class Visualizer:
 
         self.render_packs = [{} for _ in range(len(self.mvs))]
         self.persisted_render_packs = [{} for _ in range(len(self.mvs))]
+        self.draw_faces = draw_faces
 
         self.set_titlebar()
 
@@ -278,9 +281,8 @@ class Visualizer:
         if "body" in render_pack and render_pack["body"] is not None:
             body = render_pack["body"]
             body_verts = c2c(body["v"])
-            body_faces = c2c(body["f"])
-            # body_mesh = Mesh(v=body_verts, f=body_faces, vc=colors["grey"])
-            body_mesh = Mesh(v=body_verts, f=[], vc=colors["grey"])
+            body_faces = c2c(body["f"]) if self.draw_faces else []
+            body_mesh = Mesh(v=body_verts, f=body_faces, vc=colors["grey"])
             static_meshes.append(body_mesh)
 
             if (
@@ -445,12 +447,12 @@ def extract_orients_from_df(
     return marker_quats
 
 
-def marker_quats_to_normals(marker_quats: dict) -> dict:
-    marker_orients = {}
+def apply_marker_quats_to_vector(marker_quats: dict, vec: torch.Tensor) -> dict:
+    marker_vecs = {}
+    vec = vec.to(TORCH_DEVICE)
     for name, quats in marker_quats.items():
-        z_vec = torch.tensor([0, 0, 1], dtype=torch.float32).to(TORCH_DEVICE)
-        marker_orients[name] = quaternion_apply(quats, z_vec)
-    return marker_orients
+        marker_vecs[name] = quaternion_apply(quats, vec)
+    return marker_vecs
 
 
 # =====================================================================================
@@ -548,7 +550,7 @@ def fit_bodies(
             max_iter=optimizer_args.get("max_iter", 300),
             tolerance_change=optimizer_args.get("tolerance_change", 1e-5),
             max_eval=optimizer_args.get("max_eval", None),
-            history_size=optimizer_args.get("history_size", 100),
+            history_size=optimizer_args.get("history_size", 300),
             line_search_fn=optimizer_args.get("line_search_fn", "strong_wolfe"),
         )
     else:
@@ -604,33 +606,78 @@ def fit_bodies(
 
 def create_loss_function(
     body_model,
-    marker_orients: dict,
+    marker_normals: dict,
+    marker_orients_x: dict,
+    marker_orients_x_vids: dict,
     markers: dict,
 ):
+    # setup
+    marker_names = list(markers.keys())
+    markers_vert_ids = [markers[name] for name in marker_names]
+    markers_orients_x_vert_ids = [marker_orients_x_vids[name] for name in marker_names]
+
     def loss_function(body_params=None, idx=None):
         if body_params is None:
             raise ValueError("body_params cannot be None")
 
         body = body_model(**body_params)
+        
+        losses = {}
 
         # ===================== MARKER ORIENT LOSS =====================
-        vertex_normals = compute_vertex_normal_batched(body.v, body.f)
 
-        marker_names = list(markers.keys())
-        markers_vert_ids = [markers[name] for name in marker_names]
-        target_normals = []
-        for name in marker_names:
-            target_normals.append(marker_orients[name].unsqueeze(1))
-        target_normals = torch.cat(target_normals, dim=1)
+        # compute loss for normals
+        pred_marker_normals = compute_vertex_normal_batched(body.v, body.f)[
+            :, markers_vert_ids, :
+        ]
+        target_marker_normals = [
+            marker_normals[name].unsqueeze(1) for name in marker_names
+        ]
+        target_marker_normals = torch.cat(target_marker_normals, dim=1)
+        target_marker_normals.masked_fill_(target_marker_normals.isnan(), 0)
+        normals_cos = nn.CosineSimilarity(dim=-1, eps=1e-6)
+        normals_loss = 1 - normals_cos(pred_marker_normals, target_marker_normals)
+        normals_loss = normals_loss.mean()
+        losses["normals_loss"] = normals_loss
 
-        pred_normals = vertex_normals[:, markers_vert_ids, :]
-
-        # compute cosine distance
-        cos = nn.CosineSimilarity(dim=-1, eps=1e-6)
-        orient_loss = 1 - cos(pred_normals, target_normals)
+        # compute loss for orients_x
+        pred_marker_pos = body.v[:, markers_vert_ids, :]
+        pred_marker_towards = body.v[:, markers_orients_x_vert_ids, :]
+        pred_marker_orient_x = nn.functional.normalize(
+            pred_marker_towards - pred_marker_pos, dim=-1
+        )
+        target_marker_orient_x = [
+            marker_orients_x[name].unsqueeze(1) for name in marker_names
+        ]
+        target_marker_orient_x = torch.cat(target_marker_orient_x, dim=1)
+        target_marker_orient_x.masked_fill_(target_marker_orient_x.isnan(), 0)
+        orient_cos = nn.CosineSimilarity(dim=-1, eps=1e-6)
+        orient_loss = 1 - orient_cos(pred_marker_orient_x, target_marker_orient_x)
         orient_loss = orient_loss.mean()
+        losses["orient_loss"] = orient_loss
+        
+        # compute temporal smoothness loss on body_pose_latent
+        bpl = body_params["pose_body_latent"]
+        bpl_diff = bpl[1:] - bpl[:-1]
+        smoothness_loss = (bpl_diff ** 2).mean()
+        losses["smoothness_loss"] = smoothness_loss * 0.1 # weight it down
 
-        return orient_loss
+        # # print all
+        # print("pred_marker_normals:", pred_marker_normals.isnan().sum())
+        # print("target_marker_normals:", target_marker_normals.isnan().sum())
+        # print("normals_loss:", normals_loss.isnan().sum())
+        # print("pred_marker_pos:", pred_marker_pos.isnan().sum())
+        # print("pred_marker_towards:", pred_marker_towards.isnan().sum())
+        # print("pred_marker_orient_x:", pred_marker_orient_x.isnan().sum())
+        # print("target_marker_orient_x:", target_marker_orient_x.isnan().sum())
+        # print("orient_loss:", orient_loss.isnan().sum())
+        # print()
+        # print()
+
+        # compute overall loss
+        total_loss = sum(losses.values())
+
+        return total_loss
 
     return loss_function
 
@@ -645,12 +692,15 @@ DEFAULT_TARGET_CONFIG = {
     "coord_suffixes": ["_x", "_y", "_z"],
 }
 
+# ================================ MAIN OPTIMIZE ======================================
 
-def main(
+
+def main_optimize(
     body_model_path=None,
     vposer_expr_dir=None,
     target_path=None,
     markers_path=None,
+    optimized_body_path=None,
     target_config=None,
 ):
     # ========================= VERIFY INPUTS =========================
@@ -671,6 +721,10 @@ def main(
         print("Please provide a valid markers_path")
         return
 
+    if optimized_body_path is None:
+        print("Please provide a valid optimized_body_path")
+        return
+
     if target_config is None:
         target_config = DEFAULT_TARGET_CONFIG
 
@@ -689,6 +743,16 @@ def main(
     )
     vp_model = vp_model.to(TORCH_DEVICE)
 
+    # load target dataframe
+    target_df = pd.read_csv(target_path)
+    target_df = target_df.iloc[750:1250]
+    # target_df = target_df.iloc[250:500]
+
+    marker_quats = extract_orients_from_df(
+        target_df,
+        suffixes=target_config["orient_suffixes"],
+    )
+
     # load markers
     markers_data = np.load(markers_path, allow_pickle=True)
     markers = {
@@ -698,42 +762,57 @@ def main(
         )
     }
 
-    # load target dataframe
-    target_df = pd.read_csv(target_path)
-
-    # trim
-    target_df = target_df.iloc[0:1000]
-    # target_df = target_df.iloc[250:500]
-
-    marker_quats = extract_orients_from_df(
-        target_df,
-        suffixes=target_config["orient_suffixes"],
-    )
-    marker_orients = marker_quats_to_normals(marker_quats)
-
-    # filter markers to those present in both marker_orients and markers
-    common_markers = set(marker_orients.keys()).intersection(set(markers.keys()))
-    marker_orients = {k: v for k, v in marker_orients.items() if k in common_markers}
+    # filter markers to those present in both marker_normals and marker_quats
+    common_markers = set(marker_quats.keys()).intersection(set(markers.keys()))
     markers = {k: v for k, v in markers.items() if k in common_markers}
+    marker_quats = {k: v for k, v in marker_quats.items() if k in common_markers}
+
+    # compute needed references
+    marker_orients_x = apply_marker_quats_to_vector(
+        marker_quats, torch.tensor([1, 0, 0], dtype=torch.float32)
+    )
+    marker_orients_y = apply_marker_quats_to_vector(
+        marker_quats, torch.tensor([0, 1, 0], dtype=torch.float32)
+    )
+    marker_orients_z = apply_marker_quats_to_vector(
+        marker_quats, torch.tensor([0, 0, 1], dtype=torch.float32)
+    )
+    marker_orients_x_vids = {
+        name: vertex_id
+        for name, vertex_id in zip(
+            markers_data["marker_names"], markers_data["marker_orients"]
+        )
+    }
+
+    # for now, require that all markers have an orient_x vertex
+    if set(markers.keys()) != set(marker_orients_x_vids.keys()):
+        raise ValueError(
+            "All markers must have an orient_x vertex defined in the markers npz file"
+        )
 
     # ====================== OPTIMIZE SETUP ==========================
 
-    num_bodies = list(marker_orients.values())[0].shape[0]
+    num_bodies = list(marker_orients_z.values())[0].shape[0]
     print(f"Number of bodies to fit: {num_bodies}")
 
     loss_function = create_loss_function(
         body_model=body_model,
-        marker_orients=marker_orients,
+        marker_normals=marker_orients_z,
+        marker_orients_x=marker_orients_x,
+        marker_orients_x_vids=marker_orients_x_vids,
         markers=markers,
     )
 
     def callback(body_params=None, idx=None, loss=None):
         print(f"Callback at iteration {idx}, loss: {loss.item():.4f}")
 
+    # ====================== RUN OPTIMIZE AND SAVE ==========================
+
     optimized_body_params = fit_bodies(
         num_bodies,
         vp_model,
-        ['trans', 'root_orient'],
+        # ["trans", "root_orient"],
+        DEFAULT_VARS_TO_FIT,
         loss_function,
         optimizer_args={
             "type": "lbfgs",
@@ -742,116 +821,173 @@ def main(
         callback=callback,
     )
 
-    # ========================= TESTING CODE =========================
+    print(f"Saving optimized body parameters to {optimized_body_path}")
+    torch.save(optimized_body_params, optimized_body_path)
+    print("Saved.")
 
-    vis = Visualizer(rows=1, cols=1, keepalive=False)
+
+# =============================== MAIN VISUALIZE ======================================
+
+
+def main_visualize(
+    body_model_path=None,
+    optimized_body_path=None,
+    target_path=None,
+    target_indices=None,
+    markers_path=None,
+    target_config=None,
+):
+    if body_model_path is None or not exists(body_model_path):
+        print("Please provide a valid body_model_path")
+        return
+
+    if optimized_body_path is None or not exists(optimized_body_path):
+        print("Please provide a valid optimized_body_path")
+        return
+
+    if target_path is not None and (not exists(target_path) or target_indices is None):
+        print(
+            "Please provide a valid target_path and target_indices to visualize target markers"
+        )
+        return
+
+    if markers_path is not None and not exists(markers_path):
+        print("Please provide a valid markers_path")
+        return
+
+    if target_config is None:
+        target_config = DEFAULT_TARGET_CONFIG
+
+    # load smplx
+    body_model = get_body_model(body_model_path)
+    body_model = body_model.to(TORCH_DEVICE)
+
+    # load optimized body parameters
+    optimized_body_params = torch.load(optimized_body_path, map_location=TORCH_DEVICE)
+
+    # ========================= LOAD OPTIONAL DATA =========================
+
+    marker_orients_x = None
+    marker_orients_y = None
+    marker_orients_z = None
+    markers = None
+    marker_orients_x_vids = None
+
+    if target_path is not None and markers_path is not None:
+        # load target dataframe
+        target_df = pd.read_csv(target_path)
+        if target_indices is not None:
+            target_df = target_df.iloc[target_indices[0] : target_indices[1]]
+
+        marker_quats = extract_orients_from_df(
+            target_df,
+            suffixes=target_config["orient_suffixes"],
+        )
+
+        # load markers
+        markers_data = np.load(markers_path, allow_pickle=True)
+        markers = {
+            name: vertex_id
+            for name, vertex_id in zip(
+                markers_data["marker_names"], markers_data["marker_indices"]
+            )
+        }
+
+        # filter markers to those present in both marker_normals and marker_quats
+        common_markers = set(marker_quats.keys()).intersection(set(markers.keys()))
+        markers = {k: v for k, v in markers.items() if k in common_markers}
+        marker_quats = {k: v for k, v in marker_quats.items() if k in common_markers}
+
+        # compute needed references
+        marker_orients_x = apply_marker_quats_to_vector(
+            marker_quats, torch.tensor([1, 0, 0], dtype=torch.float32)
+        )
+        marker_orients_y = apply_marker_quats_to_vector(
+            marker_quats, torch.tensor([0, 1, 0], dtype=torch.float32)
+        )
+        marker_orients_z = apply_marker_quats_to_vector(
+            marker_quats, torch.tensor([0, 0, 1], dtype=torch.float32)
+        )
+        marker_orients_x_vids = {
+            name: vertex_id
+            for name, vertex_id in zip(
+                markers_data["marker_names"], markers_data["marker_orients"]
+            )
+        }
+
+    # ========================= VISUALIZATION CODE =========================
+
+    vis = Visualizer(rows=1, cols=1, keepalive=False, draw_faces=True)
 
     vis.set_autorecenter(view_id=0, autorecenter=False)
 
-    # for i in range(num_bodies):
-    for i in [0]:
-        vis.clear_view(view_id=0, re_render=False)
-        body_i = index_tensor_dict(optimized_body_params, [i])
-        result_body = body_model(**body_i)
-        vis.display_mesh(
-            view_id=0, body=result_body, show_vertex_normals=False, re_render=False
-        )
-        vis.set_titlebar(f"Fitted Body {i + 1}/{num_bodies}")
+    num_bodies = list(optimized_body_params.values())[0].shape[0]
+    print(f"Number of bodies to visualize: {num_bodies}")
 
-        # ========================================================================
-        # ========================================================================
-        # Create lines for all three axes (X=red, Y=green, Z=blue)
-        markers_names = list(markers.keys())
-        markers_vert_ids = [markers[name] for name in markers_names]
-        marker_vertices = result_body.v[:, markers_vert_ids, :]
-        axis_lines = []
-        for axis_idx, color in enumerate(
-            [colors["red"], colors["green"], colors["blue"]]
-        ):
-            # diminish the color a bit for better visibility
-            color = np.array(color) / 1.3
-
-            axis_vectors = []
-            for name in markers_names:
-                quat = marker_quats[name][i]
-                # Apply quaternion to standard basis vectors
-                if axis_idx == 0:  # X axis
-                    axis_vec = quaternion_apply(
-                        quat,
-                        torch.tensor([1, 0, 0], dtype=torch.float32).to(TORCH_DEVICE),
-                    )
-                elif axis_idx == 1:  # Y axis
-                    axis_vec = quaternion_apply(
-                        quat,
-                        torch.tensor([0, 1, 0], dtype=torch.float32).to(TORCH_DEVICE),
-                    )
-                else:  # Z axis
-                    axis_vec = quaternion_apply(
-                        quat,
-                        torch.tensor([0, 0, 1], dtype=torch.float32).to(TORCH_DEVICE),
-                    )
-                axis_vectors.append(axis_vec.unsqueeze(0))
-            axis_vectors = torch.cat(axis_vectors, dim=0).unsqueeze(0)
-
-            axis_lines.append(
-                _mesh_to_vertex_normal_lines(
-                    [c2c(marker_vertices[0])],
-                    normals=c2c(axis_vectors[0]),
-                    length=0.05,
-                    color=color,
-                )
+    run_once = True
+    while run_once or input("play animation? (y/n): ") == "y":
+        run_once = False
+        for i in range(num_bodies):
+            # for i in [0]:
+            vis.clear_view(view_id=0, re_render=False)
+            body_i = index_tensor_dict(optimized_body_params, [i])
+            result_body = body_model(**body_i)
+            vis.display_mesh(
+                view_id=0, body=result_body, show_vertex_normals=False, re_render=False
             )
-        marker_spheres = points_to_spheres(
-            c2c(marker_vertices[0]), radius=0.01, point_color=colors["red"]
-        )
+            vis.set_titlebar(f"Body {i + 1}/{num_bodies}")
 
-        vis.also_render(
-            view_id=0,
-            dynamic_lines=axis_lines,
-            dynamic_meshes=[marker_spheres],
-            persist=False,
-        )
-        # ========================================================================
-        # ========================================================================
+            # ========================================================================
+            # ========================================================================
+            if markers is not None and marker_orients_x is not None:
+                # Create lines for all three axes (X=red, Y=green, Z=blue)
+                markers_names = list(markers.keys())
+                markers_vert_ids = [markers[name] for name in markers_names]
+                marker_vertices = result_body.v[:, markers_vert_ids, :]
+                axis_lines = []
+                for axis_vectors, color in zip(
+                    [marker_orients_x, marker_orients_y, marker_orients_z],
+                    [colors["red"], colors["green"], colors["blue"]],
+                ):
+                    # diminish the color a bit for better visibility
+                    color = np.array(color) / 1.3
 
-        time.sleep(0.01)
+                    # Get vectors for current frame i and arrange them properly
+                    frame_vectors = []
+                    for name in markers_names:
+                        frame_vectors.append(axis_vectors[name][i].unsqueeze(0))
+                    axis_vectors = torch.cat(frame_vectors, dim=0).unsqueeze(0)
 
-    # pos_Z = [
-    #     torch.zeros((1, 32), dtype=torch.float32).to(TORCH_DEVICE) for i in range(1)
-    # ]
-    # for i in range(2700):
-    #     for d, z in enumerate(pos_Z):
-    #         # z[0][d] += 0.1
-    #         pose_body = vp_model.decode(z)["pose_body"].contiguous().view(-1, 63)
-    #         test_base = body_model(pose_body=pose_body)
-    #         vis.display_mesh(view_id=d, body=test_base, show_vertex_normals=False, re_render=False)
+                    axis_lines.append(
+                        _mesh_to_vertex_normal_lines(
+                            [c2c(marker_vertices[0])],
+                            normals=c2c(axis_vectors[0]),
+                            length=0.05,
+                            color=color,
+                        )
+                    )
+                marker_spheres = points_to_spheres(
+                    c2c(marker_vertices[0]), radius=0.01, point_color=colors["red"]
+                )
+                markers_orients_x_vert_ids = [
+                    marker_orients_x_vids[name] for name in markers_names
+                ]
+                marker_orient_x_cubes = points_to_cubes(
+                    c2c(result_body.v[:, markers_orients_x_vert_ids, :][0]),
+                    radius=0.003,
+                    point_color=colors["red"],
+                )
 
-    #         markers_names = list(markers.keys())
-    #         markers_vert_ids = [markers[name] for name in markers_names]
-    #         marker_vertices = test_base.v[:, markers_vert_ids, :]
-    #         target_normals = []
-    #         for name in markers_names:
-    #             target_normals.append(marker_orients[name][i].unsqueeze(0))
-    #         target_normals = torch.cat(target_normals, dim=0).unsqueeze(0)
-    #         target_lines = _mesh_to_vertex_normal_lines(
-    #             [c2c(marker_vertices[0])],
-    #             normals=c2c(target_normals[0]),
-    #             length=0.1,
-    #             color=colors["orange"],
-    #         )
-    #         vis.also_render(view_id=d, dynamic_lines=[target_lines], persist=False)
+                vis.also_render(
+                    view_id=0,
+                    dynamic_lines=axis_lines,
+                    dynamic_meshes=[marker_spheres, marker_orient_x_cubes],
+                    persist=False,
+                )
+            # ========================================================================
+            # ========================================================================
 
-    #     vis.set_titlebar(f"Iteration {i}")
-
-    # # sample body
-    # poses = [torch.zeros((1, 63), dtype=torch.float32) for i in range(63)]
-
-    # for i in range(100):
-    #     for d, pose in enumerate(poses):
-    #         pose[0][d] += 0.01
-    #         test_base = body_model(pose_body=pose)
-    #         vis.display_mesh(view_id=d, body=test_base)
-    #     print(i)
+            time.sleep(0.01)
 
     # =================== GO INTO INTERACTIVE MODE ====================
 
@@ -863,42 +999,117 @@ def main(
     code.interact(local=locals())
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run the main script.")
+# ================================= MAIN ARGS =========================================
 
-    parser.add_argument(
+
+def main():
+    parser = argparse.ArgumentParser(description="Run the main script.")
+    subparsers = parser.add_subparsers(dest="command", help="Sub-command help")
+
+    # ===================== OPTIMIZE PARSER =====================
+
+    optimize_parser = subparsers.add_parser(
+        "optimize", help="Optimize body parameters to fit marker orientations"
+    )
+    optimize_parser.add_argument(
         "--body_model_path",
         type=str,
         default=None,
         help="Path to the body model directory containing model.npz",
     )
-
-    parser.add_argument(
+    optimize_parser.add_argument(
         "--vposer_expr_dir",
         type=str,
         default=None,
         help="Path to the VPoser experiment directory containing snapshots and config",
     )
-
-    parser.add_argument(
+    optimize_parser.add_argument(
         "--target_path",
         type=str,
         default=None,
         help="Path to the target CSV file",
     )
-
-    parser.add_argument(
+    optimize_parser.add_argument(
         "--markers_path",
         type=str,
         default=None,
         help="Path to the markers npz file",
     )
+    optimize_parser.add_argument(
+        "--optimized_body_path",
+        type=str,
+        default=None,
+        help="Path of the optimized body parameters to save",
+    )
+
+    # ===================== VISUALIZE PARSER =====================
+    visualize_parser = subparsers.add_parser(
+        "visualize", help="Visualize optimized body parameters"
+    )
+    visualize_parser.add_argument(
+        "--body_model_path",
+        type=str,
+        default=None,
+        help="Path to the body model directory containing model.npz",
+    )
+    visualize_parser.add_argument(
+        "--optimized_body_path",
+        type=str,
+        default=None,
+        help="Path of the optimized body parameters to load",
+    )
+    visualize_parser.add_argument(
+        "--target_path",
+        type=str,
+        default=None,
+        help="Path to the target CSV file (optional, for visualizing target markers)",
+    )
+    visualize_parser.add_argument(
+        "--target_indices",
+        type=int,
+        nargs=2,
+        default=None,
+        help="Start and end indices for target data range to visualize (optional, for visualizing target markers). Example: --target_indices 0 1500",
+    )
+    visualize_parser.add_argument(
+        "--markers_path",
+        type=str,
+        default=None,
+        help="Path to the markers npz file (optional, for visualizing target markers)",
+    )
+
+    # ===================== PARSE ARGS ======================
 
     args = parser.parse_args()
 
-    main(
-        body_model_path=args.body_model_path,
-        vposer_expr_dir=args.vposer_expr_dir,
-        target_path=args.target_path,
-        markers_path=args.markers_path,
-    )
+    # ===================== RUN COMMAND =====================
+
+    if args.command == "optimize":
+        main_optimize(
+            body_model_path=args.body_model_path,
+            vposer_expr_dir=args.vposer_expr_dir,
+            target_path=args.target_path,
+            markers_path=args.markers_path,
+            optimized_body_path=args.optimized_body_path,
+        )
+    elif args.command == "visualize":
+        if args.target_indices is not None:
+            if len(args.target_indices) == 2:
+                target_indices = args.target_indices
+            else:
+                print("target_indices must be exactly 2 values: [start, end]")
+                return
+        else:
+            target_indices = None
+
+        main_visualize(
+            body_model_path=args.body_model_path,
+            optimized_body_path=args.optimized_body_path,
+            target_path=args.target_path,
+            target_indices=target_indices,
+            markers_path=args.markers_path,
+        )
+
+
+if __name__ == "__main__":
+    main()
