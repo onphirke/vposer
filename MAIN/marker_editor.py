@@ -4,20 +4,26 @@
 Interactive Marker Placement Tool for SMPL Body Model
 
 This script allows you to:
-1. Visualize the SMPL body model in 3D
+1. Visualize the SMPL body model in 3D using psbody.mesh
 2. Click on the mesh to place markers at specific vertices
 3. Name and edit markers
 4. Save marker definitions to an NPZ file
 
+Requirements:
+    - psbody.mesh (required for visualization)
+    - body_visualizer (for mesh colors)
+
 Usage:
     python marker_editor.py [--model MODEL_PATH] [--output OUTPUT_FILE]
 
-Controls:
-    - Left click on mesh to place a marker
-    - Press 'n' to name the last placed marker
-    - Press 'd' to delete the last marker
-    - Press 's' to save markers
-    - Press 'q' to quit
+Commands (interactive mode):
+    - add(x, y, z)          - Add marker at position (x, y, z)
+    - add_vertex(idx)       - Add marker at vertex index
+    - rename('old', 'new')  - Rename marker
+    - delete('name')        - Delete marker
+    - save()                - Save markers to file
+    - list()                - List all markers
+    - quit()                - Exit editor
 """
 
 import os
@@ -27,29 +33,23 @@ import sys
 import argparse
 import numpy as np
 import torch
-from typing import Dict, List, Tuple, Optional
+from typing import Optional
 
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 from human_body_prior.body_model.body_model import BodyModel
 
-# Try to import visualization tools
+# Import visualization tools - psbody mesh is required
 try:
     from psbody.mesh import Mesh, MeshViewer
     from body_visualizer.tools.vis_tools import colors
     PSBODY_AVAILABLE = True
 except ImportError:
-    print("Warning: psbody.mesh not available. Using alternative visualization.")
+    print("Error: psbody.mesh is required for this script.")
+    print("Please install it to use the marker editor.")
     PSBODY_AVAILABLE = False
-
-try:
-    import trimesh
-    import pyrender
-    PYRENDER_AVAILABLE = True
-except ImportError:
-    print("Warning: pyrender not available. Falling back to simpler visualization.")
-    PYRENDER_AVAILABLE = False
+    sys.exit(1)
 
 
 class MarkerEditor:
@@ -204,13 +204,7 @@ class MarkerEditor:
         print(f"Loaded {len(self.markers)} markers from {filepath}")
     
     def run_psbody_interactive(self):
-        """Run interactive editor using psbody.mesh (if available)."""
-        if not PSBODY_AVAILABLE:
-            print("psbody.mesh not available. Cannot run interactive editor.")
-            return
-        
-        from psbody.mesh.sphere import Sphere
-        
+        """Run interactive editor using psbody.mesh."""
         print("\n" + "="*70)
         print("Interactive Marker Editor")
         print("="*70)
@@ -306,9 +300,6 @@ class MarkerEditor:
     
     def _update_viewer(self, mv):
         """Update the mesh viewer with current markers."""
-        if not PSBODY_AVAILABLE:
-            return
-        
         from psbody.mesh.sphere import Sphere
         
         # Create marker spheres
@@ -325,92 +316,6 @@ class MarkerEditor:
         
         # Update title
         mv.set_titlebar(f"Marker Editor - {len(self.markers)} markers")
-    
-    def run_pyrender_interactive(self):
-        """Run interactive editor using pyrender (alternative)."""
-        if not PYRENDER_AVAILABLE:
-            print("pyrender not available. Cannot run interactive editor.")
-            self._run_console_only()
-            return
-        
-        print("\nPyrender interactive mode not fully implemented yet.")
-        print("Falling back to console-only mode.")
-        self._run_console_only()
-    
-    def _run_console_only(self):
-        """Console-only marker editor (no graphics)."""
-        print("\n" + "="*70)
-        print("Console-Only Marker Editor")
-        print("="*70)
-        print("Available commands:")
-        print("  add <vertex_idx> [name]  - Add marker at vertex index")
-        print("  rename <old> <new>       - Rename marker")
-        print("  delete <name>            - Delete marker")
-        print("  save [filepath]          - Save markers to file")
-        print("  load <filepath>          - Load markers from file")
-        print("  list                     - List all markers")
-        print("  quit                     - Exit editor")
-        print("="*70)
-        
-        while True:
-            try:
-                cmd = input("\n> ").strip().split()
-                if not cmd:
-                    continue
-                
-                action = cmd[0].lower()
-                
-                if action == 'add':
-                    if len(cmd) < 2:
-                        print("Usage: add <vertex_idx> [name]")
-                        continue
-                    vertex_idx = int(cmd[1])
-                    name = cmd[2] if len(cmd) > 2 else None
-                    self.add_marker(vertex_idx, name)
-                
-                elif action == 'rename':
-                    if len(cmd) < 3:
-                        print("Usage: rename <old_name> <new_name>")
-                        continue
-                    self.rename_marker(cmd[1], cmd[2])
-                
-                elif action == 'delete':
-                    if len(cmd) < 2:
-                        print("Usage: delete <name>")
-                        continue
-                    self.delete_marker(cmd[1])
-                
-                elif action == 'save':
-                    filepath = cmd[1] if len(cmd) > 1 else None
-                    self.save_markers(filepath)
-                
-                elif action == 'load':
-                    if len(cmd) < 2:
-                        print("Usage: load <filepath>")
-                        continue
-                    self.load_markers(cmd[1])
-                
-                elif action == 'list':
-                    if not self.markers:
-                        print("No markers defined.")
-                    else:
-                        print("\nCurrent markers:")
-                        for name, idx in self.markers.items():
-                            pos = self.marker_positions[name]
-                            print(f"  {name}: vertex {idx} at ({pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f})")
-                
-                elif action in ['quit', 'exit', 'q']:
-                    print("Exiting...")
-                    break
-                
-                else:
-                    print(f"Unknown command: {action}")
-            
-            except KeyboardInterrupt:
-                print("\nExiting...")
-                break
-            except Exception as e:
-                print(f"Error: {e}")
 
 
 def main():
@@ -434,11 +339,6 @@ def main():
         default=None,
         help='Load existing markers from file'
     )
-    parser.add_argument(
-        '--console-only',
-        action='store_true',
-        help='Use console-only mode (no graphics)'
-    )
     
     args = parser.parse_args()
     
@@ -449,15 +349,8 @@ def main():
     if args.load:
         editor.load_markers(args.load)
     
-    # Run appropriate interface
-    if args.console_only:
-        editor._run_console_only()
-    elif PSBODY_AVAILABLE:
-        editor.run_psbody_interactive()
-    elif PYRENDER_AVAILABLE:
-        editor.run_pyrender_interactive()
-    else:
-        editor._run_console_only()
+    # Run psbody interactive mode
+    editor.run_psbody_interactive()
 
 
 if __name__ == '__main__':

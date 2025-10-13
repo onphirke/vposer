@@ -16,7 +16,7 @@ import code
 import pandas as pd
 
 import pytorch3d.structures as pd3d_structures
-from pytorch3d.transforms import quaternion_apply
+from pytorch3d.transforms import quaternion_apply, quaternion_to_matrix
 
 print("Original PYOPENGL_PLATFORM:", os.environ.get("PYOPENGL_PLATFORM"))
 print("Forcing PYOPENGL_PLATFORM to 'glx'")
@@ -401,9 +401,15 @@ class Visualizer:
         if re_render:
             self._render(view_id)
 
+    # =============================== SET MV PARAMS ==================================
+
     def set_titlebar(self, titlebar="Visualizer"):
         self._check_initialized()
         self.mvs[0].set_titlebar(titlebar)
+
+    def set_autorecenter(self, view_id=0, autorecenter=True):
+        self._check_initialized()
+        self.mvs[view_id].set_autorecenter(autorecenter)
 
 
 # =====================================================================================
@@ -430,18 +436,20 @@ def extract_orients_from_df(
             valid_markers.append(marker)
 
     # create a dict of tensors of shape (N, 4) for quaternions
-    marker_orients = {}
+    marker_quats = {}
     for marker in valid_markers:
         orient_cols = [marker + suffix for suffix in suffixes]
-        marker_orients[marker] = df[orient_cols].to_numpy(dtype=np.float32)
-        marker_orients[marker] = torch.from_numpy(marker_orients[marker]).to(
-            TORCH_DEVICE
-        )
+        marker_quats[marker] = df[orient_cols].to_numpy(dtype=np.float32)
+        marker_quats[marker] = torch.from_numpy(marker_quats[marker]).to(TORCH_DEVICE)
 
-        # get the z-vector of the orientations
-        # z_vec = torch.tensor([0, 0, 1], dtype=torch.float32).to(TORCH_DEVICE)
-        # marker_orients[marker] = quaternion_apply(marker_orients[marker], z_vec)
+    return marker_quats
 
+
+def marker_quats_to_normals(marker_quats: dict) -> dict:
+    marker_orients = {}
+    for name, quats in marker_quats.items():
+        z_vec = torch.tensor([0, 0, 1], dtype=torch.float32).to(TORCH_DEVICE)
+        marker_orients[name] = quaternion_apply(quats, z_vec)
     return marker_orients
 
 
@@ -632,8 +640,8 @@ def create_loss_function(
 # =====================================================================================
 
 DEFAULT_TARGET_CONFIG = {
-    # "orient_suffixes": ["_rw", "_rx", "_ry", "_rz"],
-    "orient_suffixes": ["_nx", "_ny", "_nz"],
+    "orient_suffixes": ["_rw", "_rx", "_ry", "_rz"],
+    # "orient_suffixes": ["_nx", "_ny", "_nz"],
     "coord_suffixes": ["_x", "_y", "_z"],
 }
 
@@ -694,12 +702,14 @@ def main(
     target_df = pd.read_csv(target_path)
 
     # trim
-    target_df = target_df.iloc[250:500]
+    target_df = target_df.iloc[0:1000]
+    # target_df = target_df.iloc[250:500]
 
-    marker_orients = extract_orients_from_df(
+    marker_quats = extract_orients_from_df(
         target_df,
         suffixes=target_config["orient_suffixes"],
     )
+    marker_orients = marker_quats_to_normals(marker_quats)
 
     # filter markers to those present in both marker_orients and markers
     common_markers = set(marker_orients.keys()).intersection(set(markers.keys()))
@@ -723,11 +733,11 @@ def main(
     optimized_body_params = fit_bodies(
         num_bodies,
         vp_model,
-        DEFAULT_VARS_TO_FIT,
+        ['trans', 'root_orient'],
         loss_function,
         optimizer_args={
             "type": "lbfgs",
-            "max_iter": 0
+            "max_iter": 100,
         },
         callback=callback,
     )
@@ -736,38 +746,73 @@ def main(
 
     vis = Visualizer(rows=1, cols=1, keepalive=False)
 
+    vis.set_autorecenter(view_id=0, autorecenter=False)
+
     # for i in range(num_bodies):
     for i in [0]:
         vis.clear_view(view_id=0, re_render=False)
         body_i = index_tensor_dict(optimized_body_params, [i])
         result_body = body_model(**body_i)
         vis.display_mesh(
-            view_id=0, body=result_body, show_vertex_normals=True, re_render=False
+            view_id=0, body=result_body, show_vertex_normals=False, re_render=False
         )
         vis.set_titlebar(f"Fitted Body {i + 1}/{num_bodies}")
 
+        # ========================================================================
+        # ========================================================================
+        # Create lines for all three axes (X=red, Y=green, Z=blue)
         markers_names = list(markers.keys())
         markers_vert_ids = [markers[name] for name in markers_names]
         marker_vertices = result_body.v[:, markers_vert_ids, :]
-        target_normals = []
-        for name in markers_names:
-            target_normals.append(marker_orients[name][i].unsqueeze(0))
-        target_normals = torch.cat(target_normals, dim=0).unsqueeze(0)
-        target_lines = _mesh_to_vertex_normal_lines(
-            [c2c(marker_vertices[0])],
-            normals=c2c(target_normals[0]),
-            length=0.1,
-            color=colors["orange"],
-        )
+        axis_lines = []
+        for axis_idx, color in enumerate(
+            [colors["red"], colors["green"], colors["blue"]]
+        ):
+            # diminish the color a bit for better visibility
+            color = np.array(color) / 1.3
+
+            axis_vectors = []
+            for name in markers_names:
+                quat = marker_quats[name][i]
+                # Apply quaternion to standard basis vectors
+                if axis_idx == 0:  # X axis
+                    axis_vec = quaternion_apply(
+                        quat,
+                        torch.tensor([1, 0, 0], dtype=torch.float32).to(TORCH_DEVICE),
+                    )
+                elif axis_idx == 1:  # Y axis
+                    axis_vec = quaternion_apply(
+                        quat,
+                        torch.tensor([0, 1, 0], dtype=torch.float32).to(TORCH_DEVICE),
+                    )
+                else:  # Z axis
+                    axis_vec = quaternion_apply(
+                        quat,
+                        torch.tensor([0, 0, 1], dtype=torch.float32).to(TORCH_DEVICE),
+                    )
+                axis_vectors.append(axis_vec.unsqueeze(0))
+            axis_vectors = torch.cat(axis_vectors, dim=0).unsqueeze(0)
+
+            axis_lines.append(
+                _mesh_to_vertex_normal_lines(
+                    [c2c(marker_vertices[0])],
+                    normals=c2c(axis_vectors[0]),
+                    length=0.05,
+                    color=color,
+                )
+            )
         marker_spheres = points_to_spheres(
             c2c(marker_vertices[0]), radius=0.01, point_color=colors["red"]
         )
+
         vis.also_render(
             view_id=0,
-            dynamic_lines=[target_lines],
+            dynamic_lines=axis_lines,
             dynamic_meshes=[marker_spheres],
             persist=False,
         )
+        # ========================================================================
+        # ========================================================================
 
         time.sleep(0.01)
 
