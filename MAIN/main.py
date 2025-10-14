@@ -466,6 +466,31 @@ DEFAULT_VARS_TO_FIT = [
 ]
 
 
+class AdamInClosure:
+    def __init__(self, var_list, lr, max_iter=100, tolerance_change=1e-5):
+        self.optimizer = torch.optim.Adam(var_list, lr)
+        self.max_iter = max_iter
+        self.tolerance_change = tolerance_change
+
+    def step(self, closure):
+        prev_loss = None
+        for it in range(self.max_iter):
+            loss = closure()
+            self.optimizer.step()
+            if prev_loss is None:
+                prev_loss = loss
+                continue
+            if torch.isnan(loss):
+                # breakpoint()
+                break
+            if abs(loss - prev_loss) < self.tolerance_change:
+                print("abs(loss - prev_loss) <  self.tolerance_change")
+                break
+
+    def zero_grad(self):
+        self.optimizer.zero_grad()
+
+
 def fit_bodies(
     num_bodies,
     vp_model,
@@ -547,11 +572,18 @@ def fit_bodies(
         optimizer = torch.optim.LBFGS(
             list(free_vars.values()),
             lr=optimizer_args.get("lr", 1),
-            max_iter=optimizer_args.get("max_iter", 300),
+            max_iter=optimizer_args.get("max_iter", 100),
             tolerance_change=optimizer_args.get("tolerance_change", 1e-5),
             max_eval=optimizer_args.get("max_eval", None),
             history_size=optimizer_args.get("history_size", 300),
             line_search_fn=optimizer_args.get("line_search_fn", "strong_wolfe"),
+        )
+    elif optimizer_type == "adam":
+        optimizer = AdamInClosure(
+            list(free_vars.values()),
+            lr=optimizer_args.get("lr", 1e-2),
+            max_iter=optimizer_args.get("max_iter", 100),
+            tolerance_change=optimizer_args.get("tolerance_change", 1e-5),
         )
     else:
         raise ValueError(f"Unsupported optimizer type: {optimizer_type}")
@@ -613,6 +645,10 @@ def create_loss_function(
 ):
     # setup
     marker_names = list(markers.keys())
+
+    marker_names.remove("forehead")  # tmp
+    print("Using markers:", marker_names)
+
     markers_vert_ids = [markers[name] for name in marker_names]
     markers_orients_x_vert_ids = [marker_orients_x_vids[name] for name in marker_names]
 
@@ -621,7 +657,7 @@ def create_loss_function(
             raise ValueError("body_params cannot be None")
 
         body = body_model(**body_params)
-        
+
         losses = {}
 
         # ===================== MARKER ORIENT LOSS =====================
@@ -646,6 +682,16 @@ def create_loss_function(
         pred_marker_orient_x = nn.functional.normalize(
             pred_marker_towards - pred_marker_pos, dim=-1
         )
+        dot_product = torch.sum(
+            pred_marker_orient_x * pred_marker_normals, dim=-1, keepdim=True
+        )
+        projected_pred_marker_orient_x = (
+            pred_marker_orient_x - dot_product * pred_marker_normals
+        )
+        pred_marker_orient_x = nn.functional.normalize(
+            projected_pred_marker_orient_x, dim=-1
+        )
+
         target_marker_orient_x = [
             marker_orients_x[name].unsqueeze(1) for name in marker_names
         ]
@@ -654,13 +700,17 @@ def create_loss_function(
         orient_cos = nn.CosineSimilarity(dim=-1, eps=1e-6)
         orient_loss = 1 - orient_cos(pred_marker_orient_x, target_marker_orient_x)
         orient_loss = orient_loss.mean()
-        losses["orient_loss"] = orient_loss
-        
+        losses["orient_loss"] = orient_loss * 2.0  # weight it up
+
         # compute temporal smoothness loss on body_pose_latent
         bpl = body_params["pose_body_latent"]
         bpl_diff = bpl[1:] - bpl[:-1]
-        smoothness_loss = (bpl_diff ** 2).mean()
-        losses["smoothness_loss"] = smoothness_loss * 0.1 # weight it down
+        smoothness_loss = (bpl_diff**2).mean()
+        losses["smoothness_loss"] = smoothness_loss
+
+        # regularization on pose latent
+        pose_latent_reg_loss = (body_params["pose_body_latent"] ** 2).mean()
+        losses["pose_latent_reg_loss"] = pose_latent_reg_loss * 0.04  # weight it down
 
         # # print all
         # print("pred_marker_normals:", pred_marker_normals.isnan().sum())
@@ -673,6 +723,8 @@ def create_loss_function(
         # print("orient_loss:", orient_loss.isnan().sum())
         # print()
         # print()
+
+        print(f"Losses at iter {idx}: ", {k: v.item() for k, v in losses.items()})
 
         # compute overall loss
         total_loss = sum(losses.values())
@@ -745,7 +797,7 @@ def main_optimize(
 
     # load target dataframe
     target_df = pd.read_csv(target_path)
-    target_df = target_df.iloc[750:1250]
+    target_df = target_df.iloc[0:1500]
     # target_df = target_df.iloc[250:500]
 
     marker_quats = extract_orients_from_df(
@@ -814,6 +866,11 @@ def main_optimize(
         # ["trans", "root_orient"],
         DEFAULT_VARS_TO_FIT,
         loss_function,
+        # optimizer_args={
+        #     "type": "adam",
+        #     "max_iter": 100,
+        #     "lr": 1e-1,
+        # },
         optimizer_args={
             "type": "lbfgs",
             "max_iter": 100,
