@@ -612,7 +612,9 @@ def fit_bodies(
         )
 
         # compute loss
-        loss = loss_function(body_params=body_params, idx=iteration_index)
+        loss, losses_dict = loss_function(
+            body_params=body_params, idx=iteration_index, return_losses_dict=True
+        )
 
         nonlocal current_loss
         current_loss = loss.item()
@@ -622,7 +624,12 @@ def fit_bodies(
 
         # callback
         if callback is not None:
-            callback(body_params=body_params, idx=iteration_index, loss=loss)
+            callback(
+                body_params=body_params,
+                idx=iteration_index,
+                loss=loss,
+                losses_dict=losses_dict,
+            )
 
         # done, return loss for optimizer
         return loss
@@ -636,49 +643,106 @@ def fit_bodies(
     return body_params
 
 
-def create_loss_function(
-    body_model,
-    marker_normals: dict,
-    marker_orients_x: dict,
-    marker_orients_x_vids: dict,
-    markers: dict,
-):
-    # setup
-    marker_names = list(markers.keys())
+# =====================================================================================
+# ========================== OPTIMIZATION OBJECTIVES ==================================
+# =====================================================================================
 
-    marker_names.remove("forehead")  # tmp
-    print("Using markers:", marker_names)
 
-    markers_vert_ids = [markers[name] for name in marker_names]
-    markers_orients_x_vert_ids = [marker_orients_x_vids[name] for name in marker_names]
+class WeightedBodyLosses(nn.Module):
+    """Combine multiple loss functions with weights."""
 
-    def loss_function(body_params=None, idx=None):
+    def __init__(self, losses, weights):
+        super().__init__()
+        self.losses = losses
+        self.weights = weights
+
+    def forward(self, body_params=None, idx=None, return_losses_dict=False):
+        total_loss = 0
+        losses_dict = {}
+        for name, loss_fn in self.losses.items():
+            loss = loss_fn(body_params=body_params)
+            weighted_loss = self.weights.get(name, 1.0) * loss
+            losses_dict[name] = weighted_loss
+            total_loss += weighted_loss
+
+        if return_losses_dict:
+            return total_loss, losses_dict
+        else:
+            return total_loss
+
+
+class BodyPoseLatentRegularizationLoss(nn.Module):
+    def __init__(selfs):
+        super().__init__()
+
+    def forward(self, body_params=None):
+        if body_params is None:
+            raise ValueError("body_params cannot be None")
+        return (body_params["pose_body_latent"] ** 2).mean()
+
+
+class BodyPoseLatentSmoothnessLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, body_params=None):
+        if body_params is None:
+            raise ValueError("body_params cannot be None")
+        bpl = body_params["pose_body_latent"]
+        bpl_diff = bpl[1:] - bpl[:-1]
+        smoothness_loss = (bpl_diff**2).mean()
+        return smoothness_loss
+
+
+class BodyOrientLoss_Cosine(nn.Module):
+    def __init__(
+        self,
+        body_model,
+        marker_normals: dict,
+        marker_orients_x: dict,
+        marker_orients_x_vids: dict,
+        markers: dict,
+    ):
+        super().__init__()
+        self.body_model = body_model
+        self.marker_normals = marker_normals
+        self.marker_orients_x = marker_orients_x
+        self.marker_orients_x_vids = marker_orients_x_vids
+        self.markers = markers
+
+        # setup
+        self.marker_names = list(markers.keys())
+        self.markers_vert_ids = [markers[name] for name in self.marker_names]
+        self.markers_orients_x_vert_ids = [
+            marker_orients_x_vids[name] for name in self.marker_names
+        ]
+
+    def forward(self, body_params=None):
         if body_params is None:
             raise ValueError("body_params cannot be None")
 
-        body = body_model(**body_params)
+        body = self.body_model(**body_params)
 
-        losses = {}
-
-        # ===================== MARKER ORIENT LOSS =====================
+        # ===================== MARKER NORMALS LOSS =====================
 
         # compute loss for normals
         pred_marker_normals = compute_vertex_normal_batched(body.v, body.f)[
-            :, markers_vert_ids, :
+            :, self.markers_vert_ids, :
         ]
         target_marker_normals = [
-            marker_normals[name].unsqueeze(1) for name in marker_names
+            self.marker_normals[name].unsqueeze(1) for name in self.marker_names
         ]
         target_marker_normals = torch.cat(target_marker_normals, dim=1)
         target_marker_normals.masked_fill_(target_marker_normals.isnan(), 0)
         normals_cos = nn.CosineSimilarity(dim=-1, eps=1e-6)
         normals_loss = 1 - normals_cos(pred_marker_normals, target_marker_normals)
         normals_loss = normals_loss.mean()
-        losses["normals_loss"] = normals_loss
+
+        # ===================== MARKER ORIENT LOSS =====================
 
         # compute loss for orients_x
-        pred_marker_pos = body.v[:, markers_vert_ids, :]
-        pred_marker_towards = body.v[:, markers_orients_x_vert_ids, :]
+        pred_marker_pos = body.v[:, self.markers_vert_ids, :]
+        pred_marker_towards = body.v[:, self.markers_orients_x_vert_ids, :]
         pred_marker_orient_x = nn.functional.normalize(
             pred_marker_towards - pred_marker_pos, dim=-1
         )
@@ -693,46 +757,185 @@ def create_loss_function(
         )
 
         target_marker_orient_x = [
-            marker_orients_x[name].unsqueeze(1) for name in marker_names
+            self.marker_orients_x[name].unsqueeze(1) for name in self.marker_names
         ]
         target_marker_orient_x = torch.cat(target_marker_orient_x, dim=1)
         target_marker_orient_x.masked_fill_(target_marker_orient_x.isnan(), 0)
         orient_cos = nn.CosineSimilarity(dim=-1, eps=1e-6)
         orient_loss = 1 - orient_cos(pred_marker_orient_x, target_marker_orient_x)
         orient_loss = orient_loss.mean()
-        losses["orient_loss"] = orient_loss * 2.0  # weight it up
 
-        # compute temporal smoothness loss on body_pose_latent
-        bpl = body_params["pose_body_latent"]
-        bpl_diff = bpl[1:] - bpl[:-1]
-        smoothness_loss = (bpl_diff**2).mean()
-        losses["smoothness_loss"] = smoothness_loss
+        return normals_loss + orient_loss
 
-        # regularization on pose latent
-        pose_latent_reg_loss = (body_params["pose_body_latent"] ** 2).mean()
-        losses["pose_latent_reg_loss"] = pose_latent_reg_loss * 0.04  # weight it down
 
-        # # print all
-        # print("pred_marker_normals:", pred_marker_normals.isnan().sum())
-        # print("target_marker_normals:", target_marker_normals.isnan().sum())
-        # print("normals_loss:", normals_loss.isnan().sum())
-        # print("pred_marker_pos:", pred_marker_pos.isnan().sum())
-        # print("pred_marker_towards:", pred_marker_towards.isnan().sum())
-        # print("pred_marker_orient_x:", pred_marker_orient_x.isnan().sum())
-        # print("target_marker_orient_x:", target_marker_orient_x.isnan().sum())
-        # print("orient_loss:", orient_loss.isnan().sum())
-        # print()
-        # print()
+class BodyOrientLoss_Geodesic(nn.Module):
+    def __init__(
+        self,
+        body_model,
+        marker_quats: dict,
+        marker_orients_x_vids: dict,
+        markers: dict,
+    ):
+        super().__init__()
+        self.body_model = body_model
+        self.marker_quats = marker_quats
+        self.marker_orients_x_vids = marker_orients_x_vids
+        self.markers = markers
+        self.geodesic_loss_function = geodesic_loss_R(reduction='mean')
 
-        print(f"Losses at iter {idx}: ", {k: v.item() for k, v in losses.items()})
+        # setup
+        self.marker_names = list(markers.keys())
+        self.markers_vert_ids = [markers[name] for name in self.marker_names]
+        self.markers_orients_x_vert_ids = [
+            marker_orients_x_vids[name] for name in self.marker_names
+        ]
 
-        # compute overall loss
-        total_loss = sum(losses.values())
+    def forward(self, body_params=None):
+        if body_params is None:
+            raise ValueError("body_params cannot be None")
 
-        return total_loss
+        body = self.body_model(**body_params)
 
-    return loss_function
+        # ===================== COMPUTE PREDICTED ORIENTATION =====================
 
+        # Get predicted normals (Z-axis)
+        pred_marker_normals = compute_vertex_normal_batched(body.v, body.f)[
+            :, self.markers_vert_ids, :
+        ]  # (batch, num_markers, 3)
+
+        # Get predicted X-axis by computing direction from marker to orient_x vertex
+        pred_marker_pos = body.v[:, self.markers_vert_ids, :]
+        pred_marker_towards = body.v[:, self.markers_orients_x_vert_ids, :]
+        pred_marker_orient_x = nn.functional.normalize(
+            pred_marker_towards - pred_marker_pos, dim=-1
+        )
+
+        # Project X onto the plane perpendicular to Z (normal)
+        dot_product = torch.sum(
+            pred_marker_orient_x * pred_marker_normals, dim=-1, keepdim=True
+        )
+        projected_pred_marker_orient_x = (
+            pred_marker_orient_x - dot_product * pred_marker_normals
+        )
+        pred_marker_orient_x = nn.functional.normalize(
+            projected_pred_marker_orient_x, dim=-1
+        )
+
+        # Compute Y-axis as cross product of Z and X
+        pred_marker_orient_y = torch.cross(
+            pred_marker_normals, pred_marker_orient_x, dim=-1
+        )
+        pred_marker_orient_y = nn.functional.normalize(pred_marker_orient_y, dim=-1)
+
+        # Build rotation matrix from X, Y, Z axes
+        # Rotation matrix has columns [X, Y, Z]
+        pred_rot_matrices = torch.stack(
+            [pred_marker_orient_x, pred_marker_orient_y, pred_marker_normals], dim=-1
+        )  # (batch, num_markers, 3, 3)
+
+        # ===================== GET TARGET ORIENTATION =====================
+
+        # Concatenate target quaternions for all markers
+        target_quats = [
+            self.marker_quats[name].unsqueeze(1) for name in self.marker_names
+        ]
+        target_quats = torch.cat(target_quats, dim=1)  # (batch, num_markers, 4)
+        
+        # Create mask for valid (non-NaN) quaternions
+        # A quaternion is valid if all 4 components are not NaN
+        valid_mask = ~torch.any(target_quats.isnan(), dim=-1)  # (batch, num_markers)
+        
+        # Replace NaNs with zeros to avoid issues in quaternion_to_matrix
+        target_quats = torch.nan_to_num(target_quats, nan=0.0)
+
+        # Convert target quaternions to rotation matrices
+        target_rot_matrices = quaternion_to_matrix(
+            target_quats
+        )  # (batch, num_markers, 3, 3)
+
+        # ===================== COMPUTE GEODESIC LOSS =====================
+
+        # Flatten batch and marker dimensions for geodesic_loss_R
+        pred_rot_flat = pred_rot_matrices.reshape(-1, 3, 3)
+        target_rot_flat = target_rot_matrices.reshape(-1, 3, 3)
+        valid_mask_flat = valid_mask.reshape(-1)  # (batch * num_markers,)
+
+        # Compute geodesic loss only for valid entries
+        if valid_mask_flat.any():
+            geodesic_loss = self.geodesic_loss_function(
+                pred_rot_flat[valid_mask_flat], target_rot_flat[valid_mask_flat]
+            )
+            geodesic_loss = geodesic_loss.mean()
+        else:
+            # If no valid markers, return zero loss
+            geodesic_loss = torch.tensor(0.0, device=pred_rot_flat.device, requires_grad=True)
+
+        return geodesic_loss
+
+
+def create_loss_function_1(
+    body_model,
+    marker_normals: dict,
+    marker_orients_x: dict,
+    marker_orients_x_vids: dict,
+    markers: dict,
+):
+    # =============== LOSS COMPONENTS ================
+    body_orient_loss = BodyOrientLoss_Cosine(
+        body_model,
+        marker_normals,
+        marker_orients_x,
+        marker_orients_x_vids,
+        markers,
+    )
+    body_pose_latent_reg_loss = BodyPoseLatentRegularizationLoss()
+    body_pose_latent_smoothness_loss = BodyPoseLatentSmoothnessLoss()
+
+    # =============== COMBINED LOSS ================
+    losses = {
+        "body_orient_cos_loss": body_orient_loss,
+        "body_pose_latent_reg_loss": body_pose_latent_reg_loss,
+        "body_pose_latent_smoothness_loss": body_pose_latent_smoothness_loss,
+    }
+    weights = {
+        "body_orient_cos_loss": 1.0,
+        "body_pose_latent_reg_loss": 0.01,
+        "body_pose_latent_smoothness_loss": 1.0,
+    }
+
+    weighted_loss = WeightedBodyLosses(losses, weights)
+    return weighted_loss
+
+def create_loss_function_2(
+    body_model,
+    marker_quats: dict,
+    marker_orients_x_vids: dict,
+    markers: dict,
+):
+    # =============== LOSS COMPONENTS ================
+    body_orient_loss = BodyOrientLoss_Geodesic(
+        body_model,
+        marker_quats,
+        marker_orients_x_vids,
+        markers,
+    )
+    body_pose_latent_reg_loss = BodyPoseLatentRegularizationLoss()
+    body_pose_latent_smoothness_loss = BodyPoseLatentSmoothnessLoss()
+
+    # =============== COMBINED LOSS ================
+    losses = {
+        "body_orient_geodesic_loss": body_orient_loss,
+        "body_pose_latent_reg_loss": body_pose_latent_reg_loss,
+        "body_pose_latent_smoothness_loss": body_pose_latent_smoothness_loss,
+    }
+    weights = {
+        "body_orient_geodesic_loss": 1.0,
+        "body_pose_latent_reg_loss": 0.01,
+        "body_pose_latent_smoothness_loss": 1.0,
+    }
+
+    weighted_loss = WeightedBodyLosses(losses, weights)
+    return weighted_loss
 
 # =====================================================================================
 # ===================================== MAIN ==========================================
@@ -823,9 +1026,6 @@ def main_optimize(
     marker_orients_x = apply_marker_quats_to_vector(
         marker_quats, torch.tensor([1, 0, 0], dtype=torch.float32)
     )
-    marker_orients_y = apply_marker_quats_to_vector(
-        marker_quats, torch.tensor([0, 1, 0], dtype=torch.float32)
-    )
     marker_orients_z = apply_marker_quats_to_vector(
         marker_quats, torch.tensor([0, 0, 1], dtype=torch.float32)
     )
@@ -847,16 +1047,27 @@ def main_optimize(
     num_bodies = list(marker_orients_z.values())[0].shape[0]
     print(f"Number of bodies to fit: {num_bodies}")
 
-    loss_function = create_loss_function(
+    # loss_function = create_loss_function_1(
+    #     body_model=body_model,
+    #     marker_normals=marker_orients_z,
+    #     marker_orients_x=marker_orients_x,
+    #     marker_orients_x_vids=marker_orients_x_vids,
+    #     markers=markers,
+    # )
+    
+    loss_function = create_loss_function_2(
         body_model=body_model,
-        marker_normals=marker_orients_z,
-        marker_orients_x=marker_orients_x,
+        marker_quats=marker_quats,
         marker_orients_x_vids=marker_orients_x_vids,
         markers=markers,
     )
 
-    def callback(body_params=None, idx=None, loss=None):
+    def callback(body_params=None, idx=None, loss=None, losses_dict=None):
         print(f"Callback at iteration {idx}, loss: {loss.item():.4f}")
+        if losses_dict is not None:
+            for loss_name, loss_value in losses_dict.items():
+                print(f"--> {loss_name}: {loss_value.item():.4f}")
+        print("")
 
     # ====================== RUN OPTIMIZE AND SAVE ==========================
 
@@ -1044,7 +1255,7 @@ def main_visualize(
             # ========================================================================
             # ========================================================================
 
-            time.sleep(0.01)
+            time.sleep(0.007)
 
     # =================== GO INTO INTERACTIVE MODE ====================
 

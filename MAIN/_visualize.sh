@@ -4,3 +4,5 @@ uv run main.py visualize \
     --target_path ../_data/quaternions_from_euler.csv \
     --target_indices 0 1500 \
     --markers_path ./markers.npz
+
+    # --target_path ../_data/quaternions_from_oriinc.csv \
