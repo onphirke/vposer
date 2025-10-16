@@ -119,7 +119,7 @@ def _mesh_to_vertex_normal_lines(
 
 
 class Visualizer:
-    def __init__(self, rows=1, cols=1, keepalive=True, draw_faces=False):
+    def __init__(self, rows=1, cols=1, keepalive=True):
         if not can_display:
             print("Visualization not available")
             return
@@ -130,7 +130,6 @@ class Visualizer:
 
         self.render_packs = [{} for _ in range(len(self.mvs))]
         self.persisted_render_packs = [{} for _ in range(len(self.mvs))]
-        self.draw_faces = draw_faces
 
         self.set_titlebar()
 
@@ -281,8 +280,9 @@ class Visualizer:
         if "body" in render_pack and render_pack["body"] is not None:
             body = render_pack["body"]
             body_verts = c2c(body["v"])
-            body_faces = c2c(body["f"]) if self.draw_faces else []
-            body_mesh = Mesh(v=body_verts, f=body_faces, vc=colors["grey"])
+            body_faces = c2c(body["f"])
+            # body_mesh = Mesh(v=body_verts, f=body_faces, vc=colors["grey"])
+            body_mesh = Mesh(v=body_verts, f=[], vc=colors["grey"])
             static_meshes.append(body_mesh)
 
             if (
@@ -466,31 +466,6 @@ DEFAULT_VARS_TO_FIT = [
 ]
 
 
-class AdamInClosure:
-    def __init__(self, var_list, lr, max_iter=100, tolerance_change=1e-5):
-        self.optimizer = torch.optim.Adam(var_list, lr)
-        self.max_iter = max_iter
-        self.tolerance_change = tolerance_change
-
-    def step(self, closure):
-        prev_loss = None
-        for it in range(self.max_iter):
-            loss = closure()
-            self.optimizer.step()
-            if prev_loss is None:
-                prev_loss = loss
-                continue
-            if torch.isnan(loss):
-                # breakpoint()
-                break
-            if abs(loss - prev_loss) < self.tolerance_change:
-                print("abs(loss - prev_loss) <  self.tolerance_change")
-                break
-
-    def zero_grad(self):
-        self.optimizer.zero_grad()
-
-
 def fit_bodies(
     num_bodies,
     vp_model,
@@ -572,18 +547,11 @@ def fit_bodies(
         optimizer = torch.optim.LBFGS(
             list(free_vars.values()),
             lr=optimizer_args.get("lr", 1),
-            max_iter=optimizer_args.get("max_iter", 100),
+            max_iter=optimizer_args.get("max_iter", 300),
             tolerance_change=optimizer_args.get("tolerance_change", 1e-5),
             max_eval=optimizer_args.get("max_eval", None),
             history_size=optimizer_args.get("history_size", 300),
             line_search_fn=optimizer_args.get("line_search_fn", "strong_wolfe"),
-        )
-    elif optimizer_type == "adam":
-        optimizer = AdamInClosure(
-            list(free_vars.values()),
-            lr=optimizer_args.get("lr", 1e-2),
-            max_iter=optimizer_args.get("max_iter", 100),
-            tolerance_change=optimizer_args.get("tolerance_change", 1e-5),
         )
     else:
         raise ValueError(f"Unsupported optimizer type: {optimizer_type}")
@@ -612,9 +580,7 @@ def fit_bodies(
         )
 
         # compute loss
-        loss, losses_dict = loss_function(
-            body_params=body_params, idx=iteration_index, return_losses_dict=True
-        )
+        loss = loss_function(body_params=body_params, idx=iteration_index)
 
         nonlocal current_loss
         current_loss = loss.item()
@@ -624,12 +590,7 @@ def fit_bodies(
 
         # callback
         if callback is not None:
-            callback(
-                body_params=body_params,
-                idx=iteration_index,
-                loss=loss,
-                losses_dict=losses_dict,
-            )
+            callback(body_params=body_params, idx=iteration_index, loss=loss)
 
         # done, return loss for optimizer
         return loss
@@ -643,94 +604,32 @@ def fit_bodies(
     return body_params
 
 
-# =====================================================================================
-# ========================== OPTIMIZATION OBJECTIVES ==================================
-# =====================================================================================
+def create_loss_function(
+    body_model,
+    marker_normals: dict,
+    marker_orients_x: dict,
+    marker_orients_x_vids: dict,
+    markers: dict,
+):
+    # setup
+    marker_names = list(markers.keys())
+    markers_vert_ids = [markers[name] for name in marker_names]
+    markers_orients_x_vert_ids = [marker_orients_x_vids[name] for name in marker_names]
 
-
-class WeightedBodyLosses(nn.Module):
-    """Combine multiple loss functions with weights."""
-
-    def __init__(self, losses, weights):
-        super().__init__()
-        self.losses = losses
-        self.weights = weights
-
-    def forward(self, body_params=None, idx=None, return_losses_dict=False):
-        total_loss = 0
-        losses_dict = {}
-        for name, loss_fn in self.losses.items():
-            loss = loss_fn(body_params=body_params)
-            weighted_loss = self.weights.get(name, 1.0) * loss
-            losses_dict[name] = weighted_loss
-            total_loss += weighted_loss
-
-        if return_losses_dict:
-            return total_loss, losses_dict
-        else:
-            return total_loss
-
-
-class BodyPoseLatentRegularizationLoss(nn.Module):
-    def __init__(selfs):
-        super().__init__()
-
-    def forward(self, body_params=None):
-        if body_params is None:
-            raise ValueError("body_params cannot be None")
-        return (body_params["pose_body_latent"] ** 2).mean()
-
-
-class BodyPoseLatentSmoothnessLoss(nn.Module):
-    def __init__(self):
-        super().__init__()
-
-    def forward(self, body_params=None):
-        if body_params is None:
-            raise ValueError("body_params cannot be None")
-        bpl = body_params["pose_body_latent"]
-        bpl_diff = bpl[1:] - bpl[:-1]
-        smoothness_loss = (bpl_diff**2).mean()
-        return smoothness_loss
-
-
-class BodyOrientLoss_Cosine(nn.Module):
-    def __init__(
-        self,
-        body_model,
-        marker_normals: dict,
-        marker_orients_x: dict,
-        marker_orients_x_vids: dict,
-        markers: dict,
-    ):
-        super().__init__()
-        self.body_model = body_model
-        self.marker_normals = marker_normals
-        self.marker_orients_x = marker_orients_x
-        self.marker_orients_x_vids = marker_orients_x_vids
-        self.markers = markers
-
-        # setup
-        self.marker_names = list(markers.keys())
-        self.markers_vert_ids = [markers[name] for name in self.marker_names]
-        self.markers_orients_x_vert_ids = [
-            marker_orients_x_vids[name] for name in self.marker_names
-        ]
-
-    def forward(self, body_params=None):
+    def loss_function(body_params=None, idx=None):
         if body_params is None:
             raise ValueError("body_params cannot be None")
 
-        body = self.body_model(**body_params)
+        body = body_model(**body_params)
 
-        # ===================== MARKER NORMALS LOSS =====================
+        # ===================== MARKER ORIENT LOSS =====================
 
         # compute loss for normals
         pred_marker_normals = compute_vertex_normal_batched(body.v, body.f)[
-            :, self.markers_vert_ids, :
+            :, markers_vert_ids, :
         ]
         target_marker_normals = [
-            self.marker_normals[name].unsqueeze(1) for name in self.marker_names
+            marker_normals[name].unsqueeze(1) for name in marker_names
         ]
         target_marker_normals = torch.cat(target_marker_normals, dim=1)
         target_marker_normals.masked_fill_(target_marker_normals.isnan(), 0)
@@ -738,26 +637,14 @@ class BodyOrientLoss_Cosine(nn.Module):
         normals_loss = 1 - normals_cos(pred_marker_normals, target_marker_normals)
         normals_loss = normals_loss.mean()
 
-        # ===================== MARKER ORIENT LOSS =====================
-
         # compute loss for orients_x
-        pred_marker_pos = body.v[:, self.markers_vert_ids, :]
-        pred_marker_towards = body.v[:, self.markers_orients_x_vert_ids, :]
+        pred_marker_pos = body.v[:, markers_vert_ids, :]
+        pred_marker_towards = body.v[:, markers_orients_x_vert_ids, :]
         pred_marker_orient_x = nn.functional.normalize(
             pred_marker_towards - pred_marker_pos, dim=-1
         )
-        dot_product = torch.sum(
-            pred_marker_orient_x * pred_marker_normals, dim=-1, keepdim=True
-        )
-        projected_pred_marker_orient_x = (
-            pred_marker_orient_x - dot_product * pred_marker_normals
-        )
-        pred_marker_orient_x = nn.functional.normalize(
-            projected_pred_marker_orient_x, dim=-1
-        )
-
         target_marker_orient_x = [
-            self.marker_orients_x[name].unsqueeze(1) for name in self.marker_names
+            marker_orients_x[name].unsqueeze(1) for name in marker_names
         ]
         target_marker_orient_x = torch.cat(target_marker_orient_x, dim=1)
         target_marker_orient_x.masked_fill_(target_marker_orient_x.isnan(), 0)
@@ -765,180 +652,24 @@ class BodyOrientLoss_Cosine(nn.Module):
         orient_loss = 1 - orient_cos(pred_marker_orient_x, target_marker_orient_x)
         orient_loss = orient_loss.mean()
 
-        return normals_loss + orient_loss
+        # # print all
+        # print("pred_marker_normals:", pred_marker_normals.isnan().sum())
+        # print("target_marker_normals:", target_marker_normals.isnan().sum())
+        # print("normals_loss:", normals_loss.isnan().sum())
+        # print("pred_marker_pos:", pred_marker_pos.isnan().sum())
+        # print("pred_marker_towards:", pred_marker_towards.isnan().sum())
+        # print("pred_marker_orient_x:", pred_marker_orient_x.isnan().sum())
+        # print("target_marker_orient_x:", target_marker_orient_x.isnan().sum())
+        # print("orient_loss:", orient_loss.isnan().sum())
+        # print()
+        # print()
 
+        # compute overall loss
+        total_loss = normals_loss + orient_loss
 
-class BodyOrientLoss_Geodesic(nn.Module):
-    def __init__(
-        self,
-        body_model,
-        marker_quats: dict,
-        marker_orients_x_vids: dict,
-        markers: dict,
-    ):
-        super().__init__()
-        self.body_model = body_model
-        self.marker_quats = marker_quats
-        self.marker_orients_x_vids = marker_orients_x_vids
-        self.markers = markers
-        self.geodesic_loss_function = geodesic_loss_R(reduction="mean")
+        return total_loss
 
-        # setup
-        self.marker_names = list(markers.keys())
-        self.markers_vert_ids = [markers[name] for name in self.marker_names]
-        self.markers_orients_x_vert_ids = [
-            marker_orients_x_vids[name] for name in self.marker_names
-        ]
-
-    def forward(self, body_params=None):
-        if body_params is None:
-            raise ValueError("body_params cannot be None")
-
-        body = self.body_model(**body_params)
-
-        # ===================== COMPUTE PREDICTED ORIENTATION =====================
-
-        # Get predicted normals (Z-axis)
-        pred_marker_normals = compute_vertex_normal_batched(body.v, body.f)[
-            :, self.markers_vert_ids, :
-        ]  # (batch, num_markers, 3)
-
-        # Get predicted X-axis by computing direction from marker to orient_x vertex
-        pred_marker_pos = body.v[:, self.markers_vert_ids, :]
-        pred_marker_towards = body.v[:, self.markers_orients_x_vert_ids, :]
-        pred_marker_orient_x = nn.functional.normalize(
-            pred_marker_towards - pred_marker_pos, dim=-1
-        )
-
-        # Project X onto the plane perpendicular to Z (normal)
-        dot_product = torch.sum(
-            pred_marker_orient_x * pred_marker_normals, dim=-1, keepdim=True
-        )
-        projected_pred_marker_orient_x = (
-            pred_marker_orient_x - dot_product * pred_marker_normals
-        )
-        pred_marker_orient_x = nn.functional.normalize(
-            projected_pred_marker_orient_x, dim=-1
-        )
-
-        # Compute Y-axis as cross product of Z and X
-        pred_marker_orient_y = torch.cross(
-            pred_marker_normals, pred_marker_orient_x, dim=-1
-        )
-        pred_marker_orient_y = nn.functional.normalize(pred_marker_orient_y, dim=-1)
-
-        # Build rotation matrix from X, Y, Z axes
-        # Rotation matrix has columns [X, Y, Z]
-        pred_rot_matrices = torch.stack(
-            [pred_marker_orient_x, pred_marker_orient_y, pred_marker_normals], dim=-1
-        )  # (batch, num_markers, 3, 3)
-
-        # ===================== GET TARGET ORIENTATION =====================
-
-        # Concatenate target quaternions for all markers
-        target_quats = [
-            self.marker_quats[name].unsqueeze(1) for name in self.marker_names
-        ]
-        target_quats = torch.cat(target_quats, dim=1)  # (batch, num_markers, 4)
-
-        # Create mask for valid (non-NaN) quaternions
-        # A quaternion is valid if all 4 components are not NaN
-        valid_mask = ~torch.any(target_quats.isnan(), dim=-1)  # (batch, num_markers)
-
-        # Replace NaNs with zeros to avoid issues in quaternion_to_matrix
-        target_quats = torch.nan_to_num(target_quats, nan=0.0)
-
-        # Convert target quaternions to rotation matrices
-        target_rot_matrices = quaternion_to_matrix(
-            target_quats
-        )  # (batch, num_markers, 3, 3)
-
-        # ===================== COMPUTE GEODESIC LOSS =====================
-
-        # Flatten batch and marker dimensions for geodesic_loss_R
-        pred_rot_flat = pred_rot_matrices.reshape(-1, 3, 3)
-        target_rot_flat = target_rot_matrices.reshape(-1, 3, 3)
-        valid_mask_flat = valid_mask.reshape(-1)  # (batch * num_markers,)
-
-        # Compute geodesic loss only for valid entries
-        if valid_mask_flat.any():
-            geodesic_loss = self.geodesic_loss_function(
-                pred_rot_flat[valid_mask_flat], target_rot_flat[valid_mask_flat]
-            )
-            geodesic_loss = geodesic_loss.mean()
-        else:
-            # If no valid markers, return zero loss
-            geodesic_loss = torch.tensor(
-                0.0, device=pred_rot_flat.device, requires_grad=True
-            )
-
-        return geodesic_loss
-
-
-def create_loss_function_1(
-    body_model,
-    marker_normals: dict,
-    marker_orients_x: dict,
-    marker_orients_x_vids: dict,
-    markers: dict,
-):
-    # =============== LOSS COMPONENTS ================
-    body_orient_loss = BodyOrientLoss_Cosine(
-        body_model,
-        marker_normals,
-        marker_orients_x,
-        marker_orients_x_vids,
-        markers,
-    )
-    body_pose_latent_reg_loss = BodyPoseLatentRegularizationLoss()
-    body_pose_latent_smoothness_loss = BodyPoseLatentSmoothnessLoss()
-
-    # =============== COMBINED LOSS ================
-    losses = {
-        "body_orient_cos_loss": body_orient_loss,
-        "body_pose_latent_reg_loss": body_pose_latent_reg_loss,
-        "body_pose_latent_smoothness_loss": body_pose_latent_smoothness_loss,
-    }
-    weights = {
-        "body_orient_cos_loss": 1.0,
-        "body_pose_latent_reg_loss": 0.01,
-        "body_pose_latent_smoothness_loss": 1.0,
-    }
-
-    weighted_loss = WeightedBodyLosses(losses, weights)
-    return weighted_loss
-
-
-def create_loss_function_2(
-    body_model,
-    marker_quats: dict,
-    marker_orients_x_vids: dict,
-    markers: dict,
-):
-    # =============== LOSS COMPONENTS ================
-    body_orient_loss = BodyOrientLoss_Geodesic(
-        body_model,
-        marker_quats,
-        marker_orients_x_vids,
-        markers,
-    )
-    body_pose_latent_reg_loss = BodyPoseLatentRegularizationLoss()
-    body_pose_latent_smoothness_loss = BodyPoseLatentSmoothnessLoss()
-
-    # =============== COMBINED LOSS ================
-    losses = {
-        "body_orient_geodesic_loss": body_orient_loss,
-        "body_pose_latent_reg_loss": body_pose_latent_reg_loss,
-        "body_pose_latent_smoothness_loss": body_pose_latent_smoothness_loss,
-    }
-    weights = {
-        "body_orient_geodesic_loss": 1.0,
-        "body_pose_latent_reg_loss": 0.01,
-        "body_pose_latent_smoothness_loss": 1.0,
-    }
-
-    weighted_loss = WeightedBodyLosses(losses, weights)
-    return weighted_loss
+    return loss_function
 
 
 # =====================================================================================
@@ -951,15 +682,14 @@ DEFAULT_TARGET_CONFIG = {
     "coord_suffixes": ["_x", "_y", "_z"],
 }
 
-# ================================ MAIN OPTIMIZE ======================================
 
-
-def main_optimize(
+def main(
     body_model_path=None,
     vposer_expr_dir=None,
     target_path=None,
     markers_path=None,
     optimized_body_path=None,
+    visualize_only=False,
     target_config=None,
 ):
     # ========================= VERIFY INPUTS =========================
@@ -980,12 +710,13 @@ def main_optimize(
         print("Please provide a valid markers_path")
         return
 
-    if optimized_body_path is None:
-        print("Please provide a valid optimized_body_path")
+    if visualize_only and optimized_body_path is None:
+        print("Please provide a valid optimized_body_path to visualize")
         return
 
     if target_config is None:
         target_config = DEFAULT_TARGET_CONFIG
+    
 
     # ========================= SETUP =========================
 
@@ -1030,6 +761,9 @@ def main_optimize(
     marker_orients_x = apply_marker_quats_to_vector(
         marker_quats, torch.tensor([1, 0, 0], dtype=torch.float32)
     )
+    marker_orients_y = apply_marker_quats_to_vector(
+        marker_quats, torch.tensor([0, 1, 0], dtype=torch.float32)
+    )
     marker_orients_z = apply_marker_quats_to_vector(
         marker_quats, torch.tensor([0, 0, 1], dtype=torch.float32)
     )
@@ -1041,10 +775,9 @@ def main_optimize(
     }
 
     # for now, require that all markers have an orient_x vertex
-    if not set(markers.keys()).issubset(set(marker_orients_x_vids.keys())):
+    if set(markers.keys()) != set(marker_orients_x_vids.keys()):
         raise ValueError(
-            "All markers must have an orient_x vertex defined in the markers npz file.\n"
-            f"Markers: {list(markers.keys())}, Orient_x vids: {list(marker_orients_x_vids.keys())}"
+            "All markers must have an orient_x vertex defined in the markers npz file"
         )
 
     # ====================== OPTIMIZE SETUP ==========================
@@ -1052,28 +785,17 @@ def main_optimize(
     num_bodies = list(marker_orients_z.values())[0].shape[0]
     print(f"Number of bodies to fit: {num_bodies}")
 
-    # loss_function = create_loss_function_1(
-    #     body_model=body_model,
-    #     marker_normals=marker_orients_z,
-    #     marker_orients_x=marker_orients_x,
-    #     marker_orients_x_vids=marker_orients_x_vids,
-    #     markers=markers,
-    # )
-
-    loss_function = create_loss_function_2(
+    loss_function = create_loss_function(
         body_model=body_model,
-        marker_quats=marker_quats,
+        marker_normals=marker_orients_z,
+        marker_orients_x=marker_orients_x,
         marker_orients_x_vids=marker_orients_x_vids,
         markers=markers,
     )
 
-    def callback(body_params=None, idx=None, loss=None, losses_dict=None):
+    def callback(body_params=None, idx=None, loss=None):
         print(f"Callback at iteration {idx}, loss: {loss.item():.4f}")
-        if losses_dict is not None:
-            for loss_name, loss_value in losses_dict.items():
-                print(f"--> {loss_name}: {loss_value.item():.4f}")
-        print("")
-
+    
     # ====================== RUN OPTIMIZE AND SAVE ==========================
 
     optimized_body_params = fit_bodies(
@@ -1082,120 +804,23 @@ def main_optimize(
         # ["trans", "root_orient"],
         DEFAULT_VARS_TO_FIT,
         loss_function,
-        # optimizer_args={
-        #     "type": "adam",
-        #     "max_iter": 100,
-        #     "lr": 1e-1,
-        # },
         optimizer_args={
             "type": "lbfgs",
-            "max_iter": 300,
+            "max_iter": 100,
         },
         callback=callback,
     )
-
-    print(f"Saving optimized body parameters to {optimized_body_path}")
-    torch.save(optimized_body_params, optimized_body_path)
-    print("Saved.")
-
-
-# =============================== MAIN VISUALIZE ======================================
-
-
-def main_visualize(
-    body_model_path=None,
-    optimized_body_path=None,
-    target_path=None,
-    target_indices=None,
-    markers_path=None,
-    target_config=None,
-):
-    if body_model_path is None or not exists(body_model_path):
-        print("Please provide a valid body_model_path")
-        return
-
-    if optimized_body_path is None or not exists(optimized_body_path):
-        print("Please provide a valid optimized_body_path")
-        return
-
-    if target_path is not None and (not exists(target_path) or target_indices is None):
-        print(
-            "Please provide a valid target_path and target_indices to visualize target markers"
-        )
-        return
-
-    if markers_path is not None and not exists(markers_path):
-        print("Please provide a valid markers_path")
-        return
-
-    if target_config is None:
-        target_config = DEFAULT_TARGET_CONFIG
-
-    # load smplx
-    body_model = get_body_model(body_model_path)
-    body_model = body_model.to(TORCH_DEVICE)
-
-    # load optimized body parameters
-    optimized_body_params = torch.load(optimized_body_path, map_location=TORCH_DEVICE)
-
-    # ========================= LOAD OPTIONAL DATA =========================
-
-    marker_orients_x = None
-    marker_orients_y = None
-    marker_orients_z = None
-    markers = None
-    marker_orients_x_vids = None
-
-    if target_path is not None and markers_path is not None:
-        # load target dataframe
-        target_df = pd.read_csv(target_path)
-        if target_indices is not None:
-            target_df = target_df.iloc[target_indices[0] : target_indices[1]]
-
-        marker_quats = extract_orients_from_df(
-            target_df,
-            suffixes=target_config["orient_suffixes"],
-        )
-
-        # load markers
-        markers_data = np.load(markers_path, allow_pickle=True)
-        markers = {
-            name: vertex_id
-            for name, vertex_id in zip(
-                markers_data["marker_names"], markers_data["marker_indices"]
-            )
-        }
-
-        # filter markers to those present in both marker_normals and marker_quats
-        common_markers = set(marker_quats.keys()).intersection(set(markers.keys()))
-        markers = {k: v for k, v in markers.items() if k in common_markers}
-        marker_quats = {k: v for k, v in marker_quats.items() if k in common_markers}
-
-        # compute needed references
-        marker_orients_x = apply_marker_quats_to_vector(
-            marker_quats, torch.tensor([1, 0, 0], dtype=torch.float32)
-        )
-        marker_orients_y = apply_marker_quats_to_vector(
-            marker_quats, torch.tensor([0, 1, 0], dtype=torch.float32)
-        )
-        marker_orients_z = apply_marker_quats_to_vector(
-            marker_quats, torch.tensor([0, 0, 1], dtype=torch.float32)
-        )
-        marker_orients_x_vids = {
-            name: vertex_id
-            for name, vertex_id in zip(
-                markers_data["marker_names"], markers_data["marker_orients"]
-            )
-        }
+    
+    if optimized_body_path is not None:
+        print(f"Saving optimized body parameters to {optimized_body_path}")
+        torch.save(optimized_body_params, optimized_body_path)
+        print("Saved.")
 
     # ========================= VISUALIZATION CODE =========================
 
-    vis = Visualizer(rows=1, cols=1, keepalive=False, draw_faces=True)
+    vis = Visualizer(rows=1, cols=1, keepalive=False)
 
     vis.set_autorecenter(view_id=0, autorecenter=False)
-
-    num_bodies = list(optimized_body_params.values())[0].shape[0]
-    print(f"Number of bodies to visualize: {num_bodies}")
 
     run_once = True
     while run_once or input("play animation? (y/n): ") == "y":
@@ -1208,59 +833,58 @@ def main_visualize(
             vis.display_mesh(
                 view_id=0, body=result_body, show_vertex_normals=False, re_render=False
             )
-            vis.set_titlebar(f"Body {i + 1}/{num_bodies}")
+            vis.set_titlebar(f"Fitted Body {i + 1}/{num_bodies}")
 
             # ========================================================================
             # ========================================================================
-            if markers is not None and marker_orients_x is not None:
-                # Create lines for all three axes (X=red, Y=green, Z=blue)
-                markers_names = list(markers.keys())
-                markers_vert_ids = [markers[name] for name in markers_names]
-                marker_vertices = result_body.v[:, markers_vert_ids, :]
-                axis_lines = []
-                for axis_vectors, color in zip(
-                    [marker_orients_x, marker_orients_y, marker_orients_z],
-                    [colors["red"], colors["green"], colors["blue"]],
-                ):
-                    # diminish the color a bit for better visibility
-                    color = np.array(color) / 1.3
+            # Create lines for all three axes (X=red, Y=green, Z=blue)
+            markers_names = list(markers.keys())
+            markers_vert_ids = [markers[name] for name in markers_names]
+            marker_vertices = result_body.v[:, markers_vert_ids, :]
+            axis_lines = []
+            for axis_vectors, color in zip(
+                [marker_orients_x, marker_orients_y, marker_orients_z],
+                [colors["red"], colors["green"], colors["blue"]],
+            ):
+                # diminish the color a bit for better visibility
+                color = np.array(color) / 1.3
 
-                    # Get vectors for current frame i and arrange them properly
-                    frame_vectors = []
-                    for name in markers_names:
-                        frame_vectors.append(axis_vectors[name][i].unsqueeze(0))
-                    axis_vectors = torch.cat(frame_vectors, dim=0).unsqueeze(0)
+                # Get vectors for current frame i and arrange them properly
+                frame_vectors = []
+                for name in markers_names:
+                    frame_vectors.append(axis_vectors[name][i].unsqueeze(0))
+                axis_vectors = torch.cat(frame_vectors, dim=0).unsqueeze(0)
 
-                    axis_lines.append(
-                        _mesh_to_vertex_normal_lines(
-                            [c2c(marker_vertices[0])],
-                            normals=c2c(axis_vectors[0]),
-                            length=0.05,
-                            color=color,
-                        )
+                axis_lines.append(
+                    _mesh_to_vertex_normal_lines(
+                        [c2c(marker_vertices[0])],
+                        normals=c2c(axis_vectors[0]),
+                        length=0.05,
+                        color=color,
                     )
-                marker_spheres = points_to_spheres(
-                    c2c(marker_vertices[0]), radius=0.01, point_color=colors["red"]
                 )
-                markers_orients_x_vert_ids = [
-                    marker_orients_x_vids[name] for name in markers_names
-                ]
-                marker_orient_x_cubes = points_to_cubes(
-                    c2c(result_body.v[:, markers_orients_x_vert_ids, :][0]),
-                    radius=0.003,
-                    point_color=colors["red"],
-                )
+            marker_spheres = points_to_spheres(
+                c2c(marker_vertices[0]), radius=0.01, point_color=colors["red"]
+            )
+            markers_orients_x_vert_ids = [
+                marker_orients_x_vids[name] for name in markers_names
+            ]
+            marker_orient_x_cubes = points_to_cubes(
+                c2c(result_body.v[:, markers_orients_x_vert_ids, :][0]),
+                radius=0.003,
+                point_color=colors["red"],
+            )
 
-                vis.also_render(
-                    view_id=0,
-                    dynamic_lines=axis_lines,
-                    dynamic_meshes=[marker_spheres, marker_orient_x_cubes],
-                    persist=False,
-                )
+            vis.also_render(
+                view_id=0,
+                dynamic_lines=axis_lines,
+                dynamic_meshes=[marker_spheres, marker_orient_x_cubes],
+                persist=False,
+            )
             # ========================================================================
             # ========================================================================
 
-            time.sleep(0.007)
+            time.sleep(0.01)
 
     # =================== GO INTO INTERACTIVE MODE ====================
 
@@ -1272,117 +896,50 @@ def main_visualize(
     code.interact(local=locals())
 
 
-# ================================= MAIN ARGS =========================================
-
-
-def main():
+if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run the main script.")
-    subparsers = parser.add_subparsers(dest="command", help="Sub-command help")
 
-    # ===================== OPTIMIZE PARSER =====================
-
-    optimize_parser = subparsers.add_parser(
-        "optimize", help="Optimize body parameters to fit marker orientations"
-    )
-    optimize_parser.add_argument(
+    parser.add_argument(
         "--body_model_path",
         type=str,
         default=None,
         help="Path to the body model directory containing model.npz",
     )
-    optimize_parser.add_argument(
+
+    parser.add_argument(
         "--vposer_expr_dir",
         type=str,
         default=None,
         help="Path to the VPoser experiment directory containing snapshots and config",
     )
-    optimize_parser.add_argument(
+
+    parser.add_argument(
         "--target_path",
         type=str,
         default=None,
         help="Path to the target CSV file",
     )
-    optimize_parser.add_argument(
+
+    parser.add_argument(
         "--markers_path",
         type=str,
         default=None,
         help="Path to the markers npz file",
     )
-    optimize_parser.add_argument(
+    
+    parser.add_argument(
         "--optimized_body_path",
         type=str,
         default=None,
-        help="Path of the optimized body parameters to save",
+        help="Path of the optimized body parameters",
     )
-
-    # ===================== VISUALIZE PARSER =====================
-    visualize_parser = subparsers.add_parser(
-        "visualize", help="Visualize optimized body parameters"
-    )
-    visualize_parser.add_argument(
-        "--body_model_path",
-        type=str,
-        default=None,
-        help="Path to the body model directory containing model.npz",
-    )
-    visualize_parser.add_argument(
-        "--optimized_body_path",
-        type=str,
-        default=None,
-        help="Path of the optimized body parameters to load",
-    )
-    visualize_parser.add_argument(
-        "--target_path",
-        type=str,
-        default=None,
-        help="Path to the target CSV file (optional, for visualizing target markers)",
-    )
-    visualize_parser.add_argument(
-        "--target_indices",
-        type=int,
-        nargs=2,
-        default=None,
-        help="Start and end indices for target data range to visualize (optional, for visualizing target markers). Example: --target_indices 0 1500",
-    )
-    visualize_parser.add_argument(
-        "--markers_path",
-        type=str,
-        default=None,
-        help="Path to the markers npz file (optional, for visualizing target markers)",
-    )
-
-    # ===================== PARSE ARGS ======================
 
     args = parser.parse_args()
 
-    # ===================== RUN COMMAND =====================
-
-    if args.command == "optimize":
-        main_optimize(
-            body_model_path=args.body_model_path,
-            vposer_expr_dir=args.vposer_expr_dir,
-            target_path=args.target_path,
-            markers_path=args.markers_path,
-            optimized_body_path=args.optimized_body_path,
-        )
-    elif args.command == "visualize":
-        if args.target_indices is not None:
-            if len(args.target_indices) == 2:
-                target_indices = args.target_indices
-            else:
-                print("target_indices must be exactly 2 values: [start, end]")
-                return
-        else:
-            target_indices = None
-
-        main_visualize(
-            body_model_path=args.body_model_path,
-            optimized_body_path=args.optimized_body_path,
-            target_path=args.target_path,
-            target_indices=target_indices,
-            markers_path=args.markers_path,
-        )
-
-
-if __name__ == "__main__":
-    main()
+    main(
+        body_model_path=args.body_model_path,
+        vposer_expr_dir=args.vposer_expr_dir,
+        target_path=args.target_path,
+        markers_path=args.markers_path,
+        optimized_body_path=args.optimized_body_path,
+    )

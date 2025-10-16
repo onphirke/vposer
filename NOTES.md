@@ -38,3 +38,6 @@ vposer compresses the body pose of 63 params (21 joints * 3) to a latent space (
 
 through this, it learns valid poses
 
+---
+
+geodesic loss didnt produce great results. very choppy and stuff
