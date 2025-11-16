@@ -1004,7 +1004,7 @@ def main_optimize(
 
     # load target dataframe
     target_df = pd.read_csv(target_path)
-    target_df = target_df.iloc[0:1500]
+    target_df = target_df.iloc[500:1500]
     # target_df = target_df.iloc[250:500]
 
     marker_quats = extract_orients_from_df(
@@ -1052,20 +1052,20 @@ def main_optimize(
     num_bodies = list(marker_orients_z.values())[0].shape[0]
     print(f"Number of bodies to fit: {num_bodies}")
 
-    # loss_function = create_loss_function_1(
-    #     body_model=body_model,
-    #     marker_normals=marker_orients_z,
-    #     marker_orients_x=marker_orients_x,
-    #     marker_orients_x_vids=marker_orients_x_vids,
-    #     markers=markers,
-    # )
-
-    loss_function = create_loss_function_2(
+    loss_function = create_loss_function_1(
         body_model=body_model,
-        marker_quats=marker_quats,
+        marker_normals=marker_orients_z,
+        marker_orients_x=marker_orients_x,
         marker_orients_x_vids=marker_orients_x_vids,
         markers=markers,
     )
+
+    # loss_function = create_loss_function_2(
+    #     body_model=body_model,
+    #     marker_quats=marker_quats,
+    #     marker_orients_x_vids=marker_orients_x_vids,
+    #     markers=markers,
+    # )
 
     def callback(body_params=None, idx=None, loss=None, losses_dict=None):
         print(f"Callback at iteration {idx}, loss: {loss.item():.4f}")
@@ -1197,69 +1197,70 @@ def main_visualize(
     num_bodies = list(optimized_body_params.values())[0].shape[0]
     print(f"Number of bodies to visualize: {num_bodies}")
 
+    def render_body(i):
+        vis.clear_view(view_id=0, re_render=False)
+        body_i = index_tensor_dict(optimized_body_params, [i])
+        result_body = body_model(**body_i)
+        vis.display_mesh(
+            view_id=0, body=result_body, show_vertex_normals=False, re_render=False
+        )
+        vis.set_titlebar(f"Body {i + 1}/{num_bodies}")
+
+        # ========================================================================
+        # ========================================================================
+        if markers is not None and marker_orients_x is not None:
+            # Create lines for all three axes (X=red, Y=green, Z=blue)
+            markers_names = list(markers.keys())
+            markers_vert_ids = [markers[name] for name in markers_names]
+            marker_vertices = result_body.v[:, markers_vert_ids, :]
+            axis_lines = []
+            for axis_vectors, color in zip(
+                [marker_orients_x, marker_orients_y, marker_orients_z],
+                [colors["red"], colors["green"], colors["blue"]],
+            ):
+                # diminish the color a bit for better visibility
+                color = np.array(color) / 1.3
+
+                # Get vectors for current frame i and arrange them properly
+                frame_vectors = []
+                for name in markers_names:
+                    frame_vectors.append(axis_vectors[name][i].unsqueeze(0))
+                axis_vectors = torch.cat(frame_vectors, dim=0).unsqueeze(0)
+
+                axis_lines.append(
+                    _mesh_to_vertex_normal_lines(
+                        [c2c(marker_vertices[0])],
+                        normals=c2c(axis_vectors[0]),
+                        length=0.05,
+                        color=color,
+                    )
+                )
+            marker_spheres = points_to_spheres(
+                c2c(marker_vertices[0]), radius=0.01, point_color=colors["red"]
+            )
+            markers_orients_x_vert_ids = [
+                marker_orients_x_vids[name] for name in markers_names
+            ]
+            marker_orient_x_cubes = points_to_cubes(
+                c2c(result_body.v[:, markers_orients_x_vert_ids, :][0]),
+                radius=0.003,
+                point_color=colors["red"],
+            )
+
+            vis.also_render(
+                view_id=0,
+                dynamic_lines=axis_lines,
+                dynamic_meshes=[marker_spheres, marker_orient_x_cubes],
+                persist=False,
+            )
+        # ========================================================================
+        # ========================================================================
+
     run_once = True
     while run_once or input("play animation? (y/n): ") == "y":
         run_once = False
         for i in range(num_bodies):
-            # for i in [0]:
-            vis.clear_view(view_id=0, re_render=False)
-            body_i = index_tensor_dict(optimized_body_params, [i])
-            result_body = body_model(**body_i)
-            vis.display_mesh(
-                view_id=0, body=result_body, show_vertex_normals=False, re_render=False
-            )
-            vis.set_titlebar(f"Body {i + 1}/{num_bodies}")
-
-            # ========================================================================
-            # ========================================================================
-            if markers is not None and marker_orients_x is not None:
-                # Create lines for all three axes (X=red, Y=green, Z=blue)
-                markers_names = list(markers.keys())
-                markers_vert_ids = [markers[name] for name in markers_names]
-                marker_vertices = result_body.v[:, markers_vert_ids, :]
-                axis_lines = []
-                for axis_vectors, color in zip(
-                    [marker_orients_x, marker_orients_y, marker_orients_z],
-                    [colors["red"], colors["green"], colors["blue"]],
-                ):
-                    # diminish the color a bit for better visibility
-                    color = np.array(color) / 1.3
-
-                    # Get vectors for current frame i and arrange them properly
-                    frame_vectors = []
-                    for name in markers_names:
-                        frame_vectors.append(axis_vectors[name][i].unsqueeze(0))
-                    axis_vectors = torch.cat(frame_vectors, dim=0).unsqueeze(0)
-
-                    axis_lines.append(
-                        _mesh_to_vertex_normal_lines(
-                            [c2c(marker_vertices[0])],
-                            normals=c2c(axis_vectors[0]),
-                            length=0.05,
-                            color=color,
-                        )
-                    )
-                marker_spheres = points_to_spheres(
-                    c2c(marker_vertices[0]), radius=0.01, point_color=colors["red"]
-                )
-                markers_orients_x_vert_ids = [
-                    marker_orients_x_vids[name] for name in markers_names
-                ]
-                marker_orient_x_cubes = points_to_cubes(
-                    c2c(result_body.v[:, markers_orients_x_vert_ids, :][0]),
-                    radius=0.003,
-                    point_color=colors["red"],
-                )
-
-                vis.also_render(
-                    view_id=0,
-                    dynamic_lines=axis_lines,
-                    dynamic_meshes=[marker_spheres, marker_orient_x_cubes],
-                    persist=False,
-                )
-            # ========================================================================
-            # ========================================================================
-
+            render_body(i)
             time.sleep(0.007)
 
     # =================== GO INTO INTERACTIVE MODE ====================
